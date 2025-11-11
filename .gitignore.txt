@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.env
+venv/
+env/
+*.csv
+*.xlsx
+.DS_Store
+excel/*.csv
+excel/*.xlsx
