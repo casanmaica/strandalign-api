@@ -6,7 +6,7 @@ import sys
 import traceback
 
 # Reuse helpers from existing ML script
-from .machine_learning import (
+from machine_learning import (
     find_label_columns,
     remove_tagalog_columns,
     prepare_features,
