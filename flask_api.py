@@ -20,6 +20,7 @@ import os
 import json
 import numpy as np
 import joblib
+import datetime
 
 app = Flask(__name__)
 CORS(app)
@@ -151,8 +152,88 @@ def predict_dataframe(df_in: pd.DataFrame):
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
-
+    """Enhanced health check with model status"""
+    health_data = {
+        "status": "ok",
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "service": "StrandAlign ML API",
+        "version": "1.0"
+    }
+    
+    # Check model files
+    model_status = {
+        "model_loaded": False,
+        "scaler_loaded": False,
+        "features_loaded": False,
+        "model_file_exists": os.path.exists(MODEL_OUTPUT),
+        "scaler_file_exists": os.path.exists(SCALER_OUTPUT),
+        "features_file_exists": os.path.exists(FEATURES_OUTPUT)
+    }
+    
+    # Try to load model bundle
+    try:
+        model, scaler, feature_data = load_model_bundle()
+        model_status["model_loaded"] = model is not None
+        model_status["scaler_loaded"] = scaler is not None
+        model_status["features_loaded"] = feature_data is not None
+        
+        if feature_data:
+            model_status["num_features"] = len(feature_data.get("feature_names", []))
+            
+        # Check if model can predict
+        if model is not None:
+            try:
+                # Get model classes if available
+                model_status["model_classes"] = list(getattr(model, 'classes_', ['Academic', 'TechPro', 'Undecided']))
+                model_status["ready_for_predictions"] = True
+            except Exception:
+                model_status["ready_for_predictions"] = False
+        else:
+            model_status["ready_for_predictions"] = False
+            model_status["fallback_mode"] = "Using simple rule prediction"
+    except Exception as e:
+        model_status["error"] = str(e)
+        model_status["ready_for_predictions"] = False
+    
+    health_data["model_status"] = model_status
+    
+    # Overall health determination
+    if model_status.get("ready_for_predictions") or (
+        model_status.get("model_file_exists") and 
+        model_status.get("scaler_file_exists") and 
+        model_status.get("features_file_exists")
+    ):
+        health_data["overall_status"] = "healthy"
+        return jsonify(health_data), 200
+    else:
+        health_data["overall_status"] = "degraded"
+        health_data["warning"] = "Model files missing, using fallback prediction"
+        return jsonify(health_data), 200
+    
+@app.get("/model/info")
+def model_info():
+    """Get detailed model information"""
+    try:
+        model, scaler, feature_data = load_model_bundle()
+        
+        info = {
+            "model_available": model is not None,
+            "scaler_available": scaler is not None,
+            "features_available": feature_data is not None,
+            "timestamp": datetime.datetime.utcnow().isoformat()
+        }
+        
+        if model is not None:
+            info["model_type"] = type(model).__name__
+            info["model_classes"] = list(getattr(model, 'classes_', ['Academic', 'TechPro', 'Undecided']))
+        
+        if feature_data:
+            info["num_features"] = len(feature_data.get("feature_names", []))
+            info["feature_names_sample"] = feature_data.get("feature_names", [])[:10]
+        
+        return jsonify(info), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.post("/predict-csv")
 def predict_csv():
