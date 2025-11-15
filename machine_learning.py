@@ -8,7 +8,10 @@ import pickle
 # Optional imports for training mode
 try:
     from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV, GridSearchCV
-    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.svm import SVC
+    from sklearn.dummy import DummyClassifier
     from sklearn.feature_selection import SelectFromModel, SelectKBest, f_classif
     from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, precision_score, recall_score, classification_report
     from sklearn.preprocessing import StandardScaler, RobustScaler
@@ -16,9 +19,39 @@ try:
     from imblearn.over_sampling import SMOTE
     from collections import Counter
     import joblib
+    import matplotlib
+    # Try to use an interactive backend for on-screen display
+    # Falls back to 'Agg' if interactive backend is not available
+    try:
+        # Try interactive backends in order of preference
+        matplotlib.use('TkAgg')  # Try TkAgg first (works on Windows, Linux, Mac)
+    except:
+        try:
+            matplotlib.use('Qt5Agg')  # Try Qt5Agg as fallback
+        except:
+            matplotlib.use('Agg')  # Fallback to non-interactive if needed
+    import matplotlib.pyplot as plt
+    import seaborn as sns
     ML_AVAILABLE = True
+    VISUALIZATION_AVAILABLE = True
+    SHOW_GRAPHS = True  # Enable on-screen display
 except ImportError:
     ML_AVAILABLE = False
+    VISUALIZATION_AVAILABLE = False
+    SHOW_GRAPHS = False
+    try:
+        import matplotlib
+        try:
+            matplotlib.use('TkAgg')
+        except:
+            matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        VISUALIZATION_AVAILABLE = True
+        SHOW_GRAPHS = True
+    except ImportError:
+        VISUALIZATION_AVAILABLE = False
+        SHOW_GRAPHS = False
 
 # Paths relative to this script
 try:
@@ -28,6 +61,7 @@ except NameError:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv else os.getcwd()
 
 EXCEL_DIR = os.path.join(SCRIPT_DIR, 'excel')
+VISUALIZATIONS_DIR = os.path.join(SCRIPT_DIR, 'visualizations')
 MODEL_OUTPUT = os.path.join(SCRIPT_DIR, 'strandalign_model.joblib')
 SCALER_OUTPUT = os.path.join(SCRIPT_DIR, 'strandalign_scaler.joblib')
 FEATURES_OUTPUT = os.path.join(SCRIPT_DIR, 'strandalign_features.json')
@@ -54,12 +88,18 @@ AUGMENT_ACADEMIC_DATA = True  # Generate synthetic Academic examples to balance 
 USE_ENHANCED_FEATURES = True  # Add features that better distinguish Academic vs TechPro
 ENABLE_DATA_QUALITY_CHECKS = True  # Perform data quality improvements (outlier detection, cleaning)
 ACADEMIC_AUGMENTATION_FACTOR = 1.5  # More aggressive: 30% more Academic samples (was 1.2)
+# Note: If BALANCE_ALL_CLASSES_EQUALLY is True, this factor is ignored and calculated automatically
 
 # TechPro class performance improvement settings
 AUGMENT_TECHPRO_DATA = True  # Generate synthetic TechPro examples to balance dataset
 TECHPRO_AUGMENTATION_FACTOR = 1.5  # More aggressive: 30% more TechPro samples (was 1.2)
+# Note: If BALANCE_ALL_CLASSES_EQUALLY is True, this factor is ignored and calculated automatically
 BOOST_TECHPRO_WEIGHT = True  # Boost TechPro class weight to improve its performance
 TECHPRO_WEIGHT_BOOST = 1.15  # 15% boost for TechPro class weight
+
+# Class balancing settings
+BALANCE_ALL_CLASSES_EQUALLY = True  # If True, augment all classes to match the largest class size
+AUGMENT_UNDECIDED_DATA = True  # Also augment Undecided class if balancing equally
 
 
 def generate_strand_breakdown(group_label):
@@ -521,9 +561,12 @@ def prepare_features(df, drop_cols=None, is_training=True, scaler=None, training
     
     # Apply feature selection if enabled
     if USE_FEATURE_SELECTION and feature_selector is not None:
+        # Convert to numpy array to avoid feature name mismatch warning
+        X_selected_array = feature_selector.transform(X_scaled.values)
+        selected_cols = [X_scaled.columns[i] for i in range(len(X_scaled.columns)) if feature_selector.get_support()[i]]
         X_scaled = pd.DataFrame(
-            feature_selector.transform(X_scaled),
-            columns=[X_scaled.columns[i] for i in range(len(X_scaled.columns)) if feature_selector.get_support()[i]],
+            X_selected_array,
+            columns=selected_cols,
             index=X_scaled.index
         )
     
@@ -731,49 +774,63 @@ def run_prediction_mode(input_csv_path: str) -> int:
         
         result_item = {
             'student_id': student_id,
-            'student_name': student_name,
-            'gmail': str(email).strip() if email is not None else '',
             'gender': str(gender).strip() if gender is not None else '',
             'age': int(age) if pd.notnull(age) and str(age).strip() != '' else '',
             'grade_section': grade_section,
-            'predicted_track': predicted,
-            'confidence': round(float(confidence), 2) if confidence is not None else 0.75,
-            'strand_breakdown': strand_breakdown
+            'recommended_track': predicted,  # Renamed from predicted_track
+            'confidence': round(float(confidence), 2) if confidence is not None else 0.75
         }
-        
-        # Add structured recommendation if available
-        if structured_rec:
-            result_item['recommendation'] = structured_rec
         
         results.append(result_item)
     
     # Ensure excel dir exists
     os.makedirs(EXCEL_DIR, exist_ok=True)
-    csv_out = os.path.join(EXCEL_DIR, 'student_predictions.csv')
-    xlsx_out = os.path.join(EXCEL_DIR, 'student_predictions.xlsx')
     
-    # Only include these specific columns: student_id, gender, age, grade_section, recommended_track, confidence
+    # Group results by grade_section to create separate CSV files
     df_out = pd.DataFrame(results)
-    required_columns = ['student_id', 'gender', 'age', 'grade_section', 'predicted_track', 'confidence']
     
-    # Select only the required columns (if they exist in the dataframe)
-    available_columns = [col for col in required_columns if col in df_out.columns]
-    if available_columns:
-        df_out = df_out[available_columns]
-        # Rename predicted_track to recommended_track for CSV output
-        if 'predicted_track' in df_out.columns:
-            df_out = df_out.rename(columns={'predicted_track': 'recommended_track'})
+    # If grade_section is available, group by it and create separate files
+    if 'grade_section' in df_out.columns and df_out['grade_section'].notna().any():
+        # Group by grade_section
+        for grade_section_value, group_df in df_out.groupby('grade_section'):
+            if pd.isna(grade_section_value) or str(grade_section_value).strip() == '':
+                # Use default filename if grade_section is missing
+                filename_safe = 'track_recommendation_Unknown.csv'
+            else:
+                # Clean grade_section for filename
+                grade_section_clean = str(grade_section_value).strip()
+                # Remove common separators and normalize
+                grade_section_clean = grade_section_clean.replace(' - ', '_').replace('-', '_')
+                grade_section_clean = grade_section_clean.replace(' & ', '_').replace('&', '_')
+                grade_section_clean = grade_section_clean.replace(' and ', '_').replace('and', '_')
+                # Replace spaces with underscores
+                grade_section_clean = grade_section_clean.replace(' ', '_')
+                # Remove any remaining special characters except underscores
+                grade_section_clean = ''.join(c if c.isalnum() or c == '_' else '' for c in grade_section_clean)
+                # Remove multiple consecutive underscores
+                while '__' in grade_section_clean:
+                    grade_section_clean = grade_section_clean.replace('__', '_')
+                # Remove leading/trailing underscores
+                grade_section_clean = grade_section_clean.strip('_')
+                filename_safe = f'track_recommendation_{grade_section_clean}.csv'
+            
+            csv_out = os.path.join(EXCEL_DIR, filename_safe)
+            # Select only required columns in order (ensure they exist)
+            required_cols = ['student_id', 'gender', 'age', 'grade_section', 'recommended_track', 'confidence']
+            available_cols = [col for col in required_cols if col in group_df.columns]
+            output_df = group_df[available_cols].copy()
+            output_df.to_csv(csv_out, index=False)
+            print(f"✅ Saved CSV for {grade_section_value}: {csv_out}", file=sys.stderr)
     else:
-        # Fallback: create empty dataframe with required columns if none exist
-        df_out = pd.DataFrame(columns=['student_id', 'gender', 'age', 'grade_section', 'recommended_track', 'confidence'])
-    
-    df_out.to_csv(csv_out, index=False)
-    # Save XLSX
-    try:
-        df_out.to_excel(xlsx_out, index=False)
-    except Exception:
-        # openpyxl missing or file locked: ignore silently, CSV still exists
-        pass
+        # If no grade_section, save single file
+        filename_safe = 'track_recommendation.csv'
+        csv_out = os.path.join(EXCEL_DIR, filename_safe)
+        # Select only required columns in order (ensure they exist)
+        required_cols = ['student_id', 'gender', 'age', 'grade_section', 'recommended_track', 'confidence']
+        available_cols = [col for col in required_cols if col in df_out.columns]
+        output_df = df_out[available_cols].copy()
+        output_df.to_csv(csv_out, index=False)
+        print(f"✅ Saved CSV: {csv_out}", file=sys.stderr)
     
     # Emit per-line JSON for PHP endpoint
     for item in results:
@@ -1245,6 +1302,382 @@ def generate_counselor_explanation(row, predicted_track, confidence, df_columns)
     }
 
 
+def create_visualizations(comparison_results=None, confusion_matrices=None, feature_importance_df=None, 
+                         class_dist_before=None, class_dist_after=None, cv_metrics=None):
+    """
+    Create comprehensive visualizations for thesis paper.
+    Saves all graphs to the visualizations directory.
+    """
+    if not VISUALIZATION_AVAILABLE:
+        print("⚠️ Visualization libraries not available. Skipping graph generation.", file=sys.stderr)
+        return
+    
+    # Check if we should show graphs on screen
+    show_graphs = globals().get('SHOW_GRAPHS', False)
+    
+    # Create visualizations directory
+    os.makedirs(VISUALIZATIONS_DIR, exist_ok=True)
+    
+    # Set style for professional-looking plots
+    try:
+        plt.style.use('seaborn-v0_8-darkgrid')
+    except:
+        try:
+            plt.style.use('seaborn-darkgrid')
+        except:
+            plt.style.use('ggplot')
+    sns.set_palette("husl")
+    
+    # 1. Model Comparison Bar Chart
+    if comparison_results:
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+            fig.suptitle('Model Comparison: Performance Metrics', fontsize=16, fontweight='bold')
+            
+            models = list(comparison_results.keys())
+            metrics = ['accuracy_mean', 'f1_mean', 'precision_mean', 'recall_mean']
+            metric_labels = ['Accuracy', 'F1-Score', 'Precision', 'Recall']
+            
+            for idx, (metric, label) in enumerate(zip(metrics, metric_labels)):
+                ax = axes[idx // 2, idx % 2]
+                values = [comparison_results[m][metric] for m in models]
+                errors = [comparison_results[m][metric.replace('_mean', '_std')] for m in models]
+                
+                # Highlight Random Forest
+                colors = ['#2ecc71' if m == 'Random Forest' else '#3498db' for m in models]
+                
+                bars = ax.barh(models, values, xerr=errors, color=colors, alpha=0.8, capsize=5)
+                ax.set_xlabel(f'{label} Score', fontsize=11)
+                ax.set_title(f'{label} Comparison', fontsize=12, fontweight='bold')
+                ax.set_xlim(0, 1.0)
+                ax.grid(axis='x', alpha=0.3)
+                
+                # Add value labels on bars
+                for i, (bar, val) in enumerate(zip(bars, values)):
+                    ax.text(val + 0.01, i, f'{val:.3f}', va='center', fontsize=9)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(VISUALIZATIONS_DIR, 'model_comparison.png'), dpi=300, bbox_inches='tight')
+            if show_graphs:
+                print("📊 Displaying Model Comparison chart. Close the window to continue...", file=sys.stderr)
+                plt.show(block=True)  # Display and wait for user to close
+            else:
+                plt.close()
+            print(f"✅ Saved model comparison chart: {os.path.join(VISUALIZATIONS_DIR, 'model_comparison.png')}", file=sys.stderr)
+        except Exception as e:
+            print(f"⚠️ Error creating model comparison chart: {str(e)}", file=sys.stderr)
+    
+    # 2. Confusion Matrix Heatmap
+    if confusion_matrices:
+        try:
+            # Use the first confusion matrix or average them
+            if isinstance(confusion_matrices, list):
+                cm = np.mean(confusion_matrices, axis=0)
+                title = 'Average Confusion Matrix (Cross-Validation)'
+            else:
+                cm = confusion_matrices
+                title = 'Confusion Matrix'
+            
+            # Normalize to percentages
+            cm_percent = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
+            
+            fig, ax = plt.subplots(figsize=(10, 8))
+            labels = ['Academic', 'Undecided', 'TechPro']
+            
+            sns.heatmap(cm_percent, annot=True, fmt='.1f', cmap='Blues', 
+                       xticklabels=labels, yticklabels=labels,
+                       cbar_kws={'label': 'Percentage (%)'}, ax=ax, vmin=0, vmax=100)
+            
+            ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
+            ax.set_xlabel('Predicted Label', fontsize=12)
+            ax.set_ylabel('True Label', fontsize=12)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(VISUALIZATIONS_DIR, 'confusion_matrix.png'), dpi=300, bbox_inches='tight')
+            if show_graphs:
+                print("📊 Displaying Confusion Matrix. Close the window to continue...", file=sys.stderr)
+                plt.show(block=True)  # Display and wait for user to close
+            else:
+                plt.close()
+            print(f"✅ Saved confusion matrix: {os.path.join(VISUALIZATIONS_DIR, 'confusion_matrix.png')}", file=sys.stderr)
+        except Exception as e:
+            print(f"⚠️ Error creating confusion matrix: {str(e)}", file=sys.stderr)
+    
+    # 3. Feature Importance Chart
+    if feature_importance_df is not None and len(feature_importance_df) > 0:
+        try:
+            # Get top 15 features
+            top_features = feature_importance_df.head(15)
+            
+            fig, ax = plt.subplots(figsize=(12, 8))
+            colors = plt.cm.viridis(np.linspace(0, 1, len(top_features)))
+            
+            bars = ax.barh(range(len(top_features)), top_features['Importance (%)'].values, color=colors)
+            ax.set_yticks(range(len(top_features)))
+            ax.set_yticklabels(top_features['Feature'].values, fontsize=9)
+            ax.set_xlabel('Importance (%)', fontsize=12)
+            ax.set_title('Top 15 Most Important Features', fontsize=14, fontweight='bold')
+            ax.grid(axis='x', alpha=0.3)
+            
+            # Add value labels
+            for i, (bar, val) in enumerate(zip(bars, top_features['Importance (%)'].values)):
+                ax.text(val + 0.2, i, f'{val:.2f}%', va='center', fontsize=9)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(VISUALIZATIONS_DIR, 'feature_importance.png'), dpi=300, bbox_inches='tight')
+            if show_graphs:
+                print("📊 Displaying Feature Importance chart. Close the window to continue...", file=sys.stderr)
+                plt.show(block=True)  # Display and wait for user to close
+            else:
+                plt.close()
+            print(f"✅ Saved feature importance chart: {os.path.join(VISUALIZATIONS_DIR, 'feature_importance.png')}", file=sys.stderr)
+        except Exception as e:
+            print(f"⚠️ Error creating feature importance chart: {str(e)}", file=sys.stderr)
+    
+    # 4. Class Distribution Before/After Augmentation
+    if class_dist_before and class_dist_after:
+        try:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+            
+            # Before augmentation
+            classes = list(class_dist_before.keys())
+            counts_before = [class_dist_before[c] for c in classes]
+            colors_map = {'Academic': '#3498db', 'TechPro': '#e74c3c', 'Undecided': '#f39c12'}
+            bar_colors = [colors_map.get(c, '#95a5a6') for c in classes]
+            
+            ax1.bar(classes, counts_before, color=bar_colors, alpha=0.8)
+            ax1.set_title('Class Distribution (Before Augmentation)', fontsize=12, fontweight='bold')
+            ax1.set_ylabel('Number of Samples', fontsize=11)
+            ax1.grid(axis='y', alpha=0.3)
+            
+            # Add value labels
+            for i, (cls, count) in enumerate(zip(classes, counts_before)):
+                ax1.text(i, count + 5, str(count), ha='center', fontsize=10, fontweight='bold')
+            
+            # After augmentation
+            counts_after = [class_dist_after[c] for c in classes]
+            ax2.bar(classes, counts_after, color=bar_colors, alpha=0.8)
+            ax2.set_title('Class Distribution (After Augmentation)', fontsize=12, fontweight='bold')
+            ax2.set_ylabel('Number of Samples', fontsize=11)
+            ax2.grid(axis='y', alpha=0.3)
+            
+            # Add value labels
+            for i, (cls, count) in enumerate(zip(classes, counts_after)):
+                ax2.text(i, count + 5, str(count), ha='center', fontsize=10, fontweight='bold')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(VISUALIZATIONS_DIR, 'class_distribution.png'), dpi=300, bbox_inches='tight')
+            if show_graphs:
+                print("📊 Displaying Class Distribution chart. Close the window to continue...", file=sys.stderr)
+                plt.show(block=True)  # Display and wait for user to close
+            else:
+                plt.close()
+            print(f"✅ Saved class distribution chart: {os.path.join(VISUALIZATIONS_DIR, 'class_distribution.png')}", file=sys.stderr)
+        except Exception as e:
+            print(f"⚠️ Error creating class distribution chart: {str(e)}", file=sys.stderr)
+    
+    # 5. Cross-Validation Metrics
+    if cv_metrics:
+        try:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            metrics = ['Accuracy', 'F1-Score', 'Precision', 'Recall']
+            means = [cv_metrics.get('mean_accuracy', 0), cv_metrics.get('mean_f1', 0),
+                    cv_metrics.get('mean_precision', 0), cv_metrics.get('mean_recall', 0)]
+            stds = [cv_metrics.get('std_accuracy', 0), cv_metrics.get('std_f1', 0),
+                   cv_metrics.get('std_precision', 0), cv_metrics.get('std_recall', 0)]
+            
+            x_pos = np.arange(len(metrics))
+            bars = ax.bar(x_pos, means, yerr=stds, capsize=10, color='#2ecc71', alpha=0.8, edgecolor='black')
+            
+            ax.set_ylabel('Score', fontsize=12)
+            ax.set_title('Cross-Validation Performance Metrics', fontsize=14, fontweight='bold')
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(metrics)
+            ax.set_ylim(0, 1.0)
+            ax.grid(axis='y', alpha=0.3)
+            
+            # Add value labels
+            for i, (bar, mean, std) in enumerate(zip(bars, means, stds)):
+                ax.text(i, mean + std + 0.02, f'{mean:.3f}±{std:.3f}', 
+                       ha='center', fontsize=10, fontweight='bold')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(VISUALIZATIONS_DIR, 'cv_metrics.png'), dpi=300, bbox_inches='tight')
+            if show_graphs:
+                print("📊 Displaying Cross-Validation Metrics chart. Close the window to continue...", file=sys.stderr)
+                plt.show(block=True)  # Display and wait for user to close
+            else:
+                plt.close()
+            print(f"✅ Saved CV metrics chart: {os.path.join(VISUALIZATIONS_DIR, 'cv_metrics.png')}", file=sys.stderr)
+        except Exception as e:
+            print(f"⚠️ Error creating CV metrics chart: {str(e)}", file=sys.stderr)
+    
+    print(f"\n📊 All visualizations saved to: {VISUALIZATIONS_DIR}", file=sys.stderr)
+
+
+def compare_models(X, y, class_weights_dict=None, cv_folds=3):
+    """
+    Compare multiple classification models to demonstrate Random Forest superiority.
+    Returns a dictionary with model comparison results.
+    """
+    print("\n" + "="*80, file=sys.stderr)
+    print("🔬 MODEL COMPARISON: Evaluating Multiple Classifiers", file=sys.stderr)
+    print("="*80, file=sys.stderr)
+    
+    # Define model configurations (will create fresh instances for each fold)
+    model_configs = {
+        'Dummy Classifier (Baseline)': {
+            'class': DummyClassifier,
+            'params': {'strategy': 'stratified', 'random_state': RANDOM_STATE}
+        },
+        'Logistic Regression': {
+            'class': LogisticRegression,
+            'params': {
+                'max_iter': 1000,
+                'random_state': RANDOM_STATE,
+                'class_weight': class_weights_dict if class_weights_dict else 'balanced',
+                'solver': 'lbfgs'
+            }
+        },
+        'Support Vector Machine (SVM)': {
+            'class': SVC,
+            'params': {
+                'kernel': 'rbf',
+                'probability': True,
+                'random_state': RANDOM_STATE,
+                'class_weight': class_weights_dict if class_weights_dict else 'balanced'
+            }
+        },
+        'Gradient Boosting': {
+            'class': GradientBoostingClassifier,
+            'params': {
+                'n_estimators': 100,
+                'max_depth': 5,
+                'random_state': RANDOM_STATE,
+                'learning_rate': 0.1
+            }
+        },
+        'Random Forest': {
+            'class': RandomForestClassifier,
+            'params': {
+                'n_estimators': CV_N_ESTIMATORS,
+                'max_depth': 25,
+                'min_samples_split': 5,
+                'min_samples_leaf': 2,
+                'random_state': RANDOM_STATE,
+                'class_weight': class_weights_dict if class_weights_dict else 'balanced',
+                'n_jobs': -1
+            }
+        }
+    }
+    
+    # Cross-validation setup
+    kf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
+    
+    # Store results for each model
+    results = {}
+    
+    for model_name, config in model_configs.items():
+        print(f"\n📊 Evaluating {model_name}...", file=sys.stderr)
+        
+        fold_accuracies = []
+        fold_f1s = []
+        fold_precisions = []
+        fold_recalls = []
+        
+        for fold_num, (train_idx, test_idx) in enumerate(kf.split(X, y), 1):
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+            
+            # Balance training data with SMOTE (except for Dummy Classifier)
+            if model_name != 'Dummy Classifier (Baseline)':
+                min_class_size = min(Counter(y_train).values())
+                if min_class_size >= 2:
+                    smote = SMOTE(random_state=RANDOM_STATE)
+                    X_train_bal, y_train_bal = smote.fit_resample(X_train, y_train)
+                else:
+                    X_train_bal, y_train_bal = X_train, y_train
+            else:
+                X_train_bal, y_train_bal = X_train, y_train
+            
+            # Train and predict
+            try:
+                # Create a fresh model instance for this fold
+                model = config['class'](**config['params'])
+                model.fit(X_train_bal, y_train_bal)
+                y_pred = model.predict(X_test)
+                
+                # Calculate metrics
+                acc = accuracy_score(y_test, y_pred)
+                f1 = f1_score(y_test, y_pred, average='weighted')
+                prec = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+                rec = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+                
+                fold_accuracies.append(acc)
+                fold_f1s.append(f1)
+                fold_precisions.append(prec)
+                fold_recalls.append(rec)
+            except Exception as e:
+                print(f"⚠️ Error in fold {fold_num} for {model_name}: {str(e)}", file=sys.stderr)
+                fold_accuracies.append(0.0)
+                fold_f1s.append(0.0)
+                fold_precisions.append(0.0)
+                fold_recalls.append(0.0)
+        
+        # Calculate mean and std
+        results[model_name] = {
+            'accuracy_mean': np.mean(fold_accuracies),
+            'accuracy_std': np.std(fold_accuracies),
+            'f1_mean': np.mean(fold_f1s),
+            'f1_std': np.std(fold_f1s),
+            'precision_mean': np.mean(fold_precisions),
+            'precision_std': np.std(fold_precisions),
+            'recall_mean': np.mean(fold_recalls),
+            'recall_std': np.std(fold_recalls)
+        }
+        
+        print(f"  Accuracy: {results[model_name]['accuracy_mean']:.4f} ± {results[model_name]['accuracy_std']:.4f}", file=sys.stderr)
+        print(f"  F1-Score: {results[model_name]['f1_mean']:.4f} ± {results[model_name]['f1_std']:.4f}", file=sys.stderr)
+    
+    # Print comparison table
+    print("\n" + "="*80, file=sys.stderr)
+    print("📊 MODEL COMPARISON RESULTS", file=sys.stderr)
+    print("="*80, file=sys.stderr)
+    print(f"{'Model':<35} {'Accuracy':<15} {'F1-Score':<15} {'Precision':<15} {'Recall':<15}", file=sys.stderr)
+    print("-"*80, file=sys.stderr)
+    
+    # Sort by F1 score (descending)
+    sorted_results = sorted(results.items(), key=lambda x: x[1]['f1_mean'], reverse=True)
+    
+    for model_name, metrics in sorted_results:
+        acc_str = f"{metrics['accuracy_mean']:.4f} ± {metrics['accuracy_std']:.4f}"
+        f1_str = f"{metrics['f1_mean']:.4f} ± {metrics['f1_std']:.4f}"
+        prec_str = f"{metrics['precision_mean']:.4f} ± {metrics['precision_std']:.4f}"
+        rec_str = f"{metrics['recall_mean']:.4f} ± {metrics['recall_std']:.4f}"
+        
+        # Highlight Random Forest
+        marker = "🏆" if model_name == 'Random Forest' else "  "
+        print(f"{marker} {model_name:<33} {acc_str:<15} {f1_str:<15} {prec_str:<15} {rec_str:<15}", file=sys.stderr)
+    
+    print("="*80, file=sys.stderr)
+    
+    # Verify Random Forest is best
+    rf_f1 = results['Random Forest']['f1_mean']
+    best_model = max(sorted_results, key=lambda x: x[1]['f1_mean'])
+    
+    if best_model[0] == 'Random Forest':
+        print(f"\n✅ Random Forest is the BEST performing model!", file=sys.stderr)
+        print(f"   F1-Score: {rf_f1:.4f} (highest among all models)", file=sys.stderr)
+    else:
+        print(f"\n⚠️ Note: {best_model[0]} achieved highest F1-Score ({best_model[1]['f1_mean']:.4f})", file=sys.stderr)
+        print(f"   Random Forest F1-Score: {rf_f1:.4f}", file=sys.stderr)
+    
+    print("="*80 + "\n", file=sys.stderr)
+    
+    return results
+
+
 def run_training_mode(test_csv_path=None, generate_explanations=False):
     
     if not ML_AVAILABLE:
@@ -1345,6 +1778,7 @@ def run_training_mode(test_csv_path=None, generate_explanations=False):
     
     df['derived_group_label'] = df.apply(derive_group_label, axis=1)
     print("🎯 Derived group label distribution (before augmentation):", file=sys.stderr)
+    class_dist_before = df['derived_group_label'].value_counts().to_dict()
     print(df['derived_group_label'].value_counts(), file=sys.stderr)
     print("", file=sys.stderr)
     
@@ -1354,24 +1788,59 @@ def run_training_mode(test_csv_path=None, generate_explanations=False):
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         df = improve_data_quality(df, numeric_cols)
     
-    # Augment Academic class data
-    academic_mask = df['derived_group_label'] == 'Academic'
-    if AUGMENT_ACADEMIC_DATA and academic_mask.sum() > 0:
-        print(f"\n📈 Augmenting Academic class data...", file=sys.stderr)
-        df = augment_class_data(df, academic_mask, "Academic", ACADEMIC_AUGMENTATION_FACTOR, AUGMENT_ACADEMIC_DATA)
-        # Re-derive labels for augmented data
-        df['derived_group_label'] = df.apply(derive_group_label, axis=1)
-    
-    # Augment TechPro class data
-    techpro_mask = df['derived_group_label'] == 'TechPro'
-    if AUGMENT_TECHPRO_DATA and techpro_mask.sum() > 0:
-        print(f"\n📈 Augmenting TechPro class data...", file=sys.stderr)
-        df = augment_class_data(df, techpro_mask, "TechPro", TECHPRO_AUGMENTATION_FACTOR, AUGMENT_TECHPRO_DATA)
-        # Re-derive labels for augmented data
-        df['derived_group_label'] = df.apply(derive_group_label, axis=1)
+    # Augment classes to balance dataset
+    if BALANCE_ALL_CLASSES_EQUALLY:
+        print(f"\n⚖️ Balancing all classes to equal size...", file=sys.stderr)
+        class_counts = df['derived_group_label'].value_counts().to_dict()
+        max_class_size = max(class_counts.values())
+        print(f"   Target size (largest class): {max_class_size}", file=sys.stderr)
+        print(f"   Current distribution: {class_counts}", file=sys.stderr)
+        
+        # Augment each class to match the largest class size
+        for class_name in class_counts.keys():
+            current_size = class_counts[class_name]
+            if current_size < max_class_size:
+                # Calculate augmentation factor needed to reach max_class_size
+                augmentation_factor = max_class_size / current_size
+                class_mask = df['derived_group_label'] == class_name
+                print(f"\n📈 Augmenting {class_name} class: {current_size} → {max_class_size} (factor: {augmentation_factor:.2f})", file=sys.stderr)
+                df = augment_class_data(df, class_mask, class_name, augmentation_factor, enabled=True)
+                # Re-derive labels for augmented data
+                df['derived_group_label'] = df.apply(derive_group_label, axis=1)
+            else:
+                print(f"   {class_name} class already at target size ({current_size})", file=sys.stderr)
+    else:
+        # Original augmentation logic (using fixed factors)
+        # Augment Academic class data
+        academic_mask = df['derived_group_label'] == 'Academic'
+        if AUGMENT_ACADEMIC_DATA and academic_mask.sum() > 0:
+            print(f"\n📈 Augmenting Academic class data...", file=sys.stderr)
+            df = augment_class_data(df, academic_mask, "Academic", ACADEMIC_AUGMENTATION_FACTOR, AUGMENT_ACADEMIC_DATA)
+            # Re-derive labels for augmented data
+            df['derived_group_label'] = df.apply(derive_group_label, axis=1)
+        
+        # Augment TechPro class data
+        techpro_mask = df['derived_group_label'] == 'TechPro'
+        if AUGMENT_TECHPRO_DATA and techpro_mask.sum() > 0:
+            print(f"\n📈 Augmenting TechPro class data...", file=sys.stderr)
+            df = augment_class_data(df, techpro_mask, "TechPro", TECHPRO_AUGMENTATION_FACTOR, AUGMENT_TECHPRO_DATA)
+            # Re-derive labels for augmented data
+            df['derived_group_label'] = df.apply(derive_group_label, axis=1)
+        
+        # Augment Undecided class data if enabled
+        if AUGMENT_UNDECIDED_DATA:
+            undecided_mask = df['derived_group_label'] == 'Undecided'
+            if undecided_mask.sum() > 0:
+                print(f"\n📈 Augmenting Undecided class data...", file=sys.stderr)
+                # Use average of other factors for Undecided
+                undecided_factor = (ACADEMIC_AUGMENTATION_FACTOR + TECHPRO_AUGMENTATION_FACTOR) / 2
+                df = augment_class_data(df, undecided_mask, "Undecided", undecided_factor, AUGMENT_UNDECIDED_DATA)
+                # Re-derive labels for augmented data
+                df['derived_group_label'] = df.apply(derive_group_label, axis=1)
     
     # Show final distribution after all augmentations
-    if (AUGMENT_ACADEMIC_DATA and academic_mask.sum() > 0) or (AUGMENT_TECHPRO_DATA and techpro_mask.sum() > 0):
+    class_dist_after = df['derived_group_label'].value_counts().to_dict()
+    if BALANCE_ALL_CLASSES_EQUALLY or (AUGMENT_ACADEMIC_DATA or AUGMENT_TECHPRO_DATA or AUGMENT_UNDECIDED_DATA):
         print("\n🎯 Derived group label distribution (after augmentation):", file=sys.stderr)
         print(df['derived_group_label'].value_counts(), file=sys.stderr)
         print("", file=sys.stderr)
@@ -1525,9 +1994,11 @@ def run_training_mode(test_csv_path=None, generate_explanations=False):
             selector_params['n_estimators'] = 100  # Use fewer for speed
             selector_params['random_state'] = RANDOM_STATE
             selector_rf = RandomForestClassifier(**selector_params)
-            selector_rf.fit(X_bal_search, y_bal_search)
+            # Fit on DataFrame to preserve feature names
+            selector_rf.fit(X, y)
             feature_selector = SelectFromModel(selector_rf, threshold=FEATURE_SELECTION_THRESHOLD, prefit=True)
-            X_selected = feature_selector.transform(X)
+            # Convert to numpy array to avoid feature name mismatch warning
+            X_selected = feature_selector.transform(X.values)
             selected_features = [feature_names[i] for i in range(len(feature_names)) if feature_selector.get_support()[i]]
             print(f"✅ Selected {len(selected_features)} features (from {len(feature_names)}, threshold={FEATURE_SELECTION_THRESHOLD})", file=sys.stderr)
         elif FEATURE_SELECTION_METHOD == 'kbest':
@@ -1542,12 +2013,29 @@ def run_training_mode(test_csv_path=None, generate_explanations=False):
         X = pd.DataFrame(X_selected, columns=selected_features, index=X.index)
         feature_names = selected_features
 
+    # Model comparison: Compare multiple models to show Random Forest is best
+    print("\n" + "="*80, file=sys.stderr)
+    print("🔬 MODEL COMPARISON PHASE", file=sys.stderr)
+    print("="*80, file=sys.stderr)
+    comparison_results = compare_models(X, y, class_weights_dict=class_weights_dict, cv_folds=3)
+    
+    # Add comparison results to summary
+    comparison_summary = {}
+    for model_name, metrics in comparison_results.items():
+        comparison_summary[model_name] = {
+            'accuracy': round(metrics['accuracy_mean'], 4),
+            'f1_score': round(metrics['f1_mean'], 4),
+            'precision': round(metrics['precision_mean'], 4),
+            'recall': round(metrics['recall_mean'], 4)
+        }
+
     # Cross-validation with enhanced metrics
     # Adjust folds based on QUICK_TRAINING_MODE
     cv_folds = 3 if QUICK_TRAINING_MODE else N_SPLITS
     print(f"\n📊 Starting {cv_folds}-fold cross-validation...", file=sys.stderr)
     kf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
     fold_accuracies, fold_f1s, fold_precisions, fold_recalls = [], [], [], []
+    confusion_matrices = []  # Store confusion matrices for visualization
 
     for fold_num, (train_idx, test_idx) in enumerate(kf.split(X, y), 1):
         print(80 * "=", file=sys.stderr)
@@ -1589,6 +2077,7 @@ def run_training_mode(test_csv_path=None, generate_explanations=False):
         fold_f1s.append(f1)
         fold_precisions.append(prec)
         fold_recalls.append(rec)
+        confusion_matrices.append(cm)  # Store for visualization
 
         print(f"Accuracy: {acc:.4f}, Weighted F1: {f1:.4f}", file=sys.stderr)
         print(f"Precision: {prec:.4f}, Recall: {rec:.4f}", file=sys.stderr)
@@ -1666,6 +2155,27 @@ def run_training_mode(test_csv_path=None, generate_explanations=False):
     
     feat_imp.to_csv(FEATURE_IMPORTANCE_OUTPUT, index=False)
     print(f"💾 Saved feature importances to {FEATURE_IMPORTANCE_OUTPUT}", file=sys.stderr)
+    
+    # Generate visualizations for thesis paper
+    print("\n📊 Generating visualizations for thesis paper...", file=sys.stderr)
+    cv_metrics_dict = {
+        'mean_accuracy': meanacc,
+        'std_accuracy': stdacc,
+        'mean_f1': meanf1,
+        'std_f1': stdf1,
+        'mean_precision': meanprec,
+        'std_precision': stdprec,
+        'mean_recall': meanrec,
+        'std_recall': stdrec
+    }
+    create_visualizations(
+        comparison_results=comparison_results if 'comparison_results' in locals() else None,
+        confusion_matrices=confusion_matrices if 'confusion_matrices' in locals() else None,
+        feature_importance_df=feat_imp,
+        class_dist_before=class_dist_before if 'class_dist_before' in locals() else None,
+        class_dist_after=class_dist_after if 'class_dist_after' in locals() else None,
+        cv_metrics=cv_metrics_dict
+    )
     
     # Save model, scaler, feature selector, and feature names
     joblib.dump(calibrated_rf, MODEL_OUTPUT)
@@ -1814,7 +2324,8 @@ def run_training_mode(test_csv_path=None, generate_explanations=False):
         'mean_recall': round(meanrec, 4),
         'std_recall': round(stdrec, 4),
         'num_features': len(feature_names),
-        'best_params': best_params
+        'best_params': best_params,
+        'model_comparison': comparison_summary if 'comparison_summary' in locals() else {}
     }
     
     print("\n📊 Model Performance Summary (JSON):", file=sys.stderr)
