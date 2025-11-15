@@ -129,70 +129,12 @@ def generate_strand_breakdown(group_label):
 
 
 def simple_rule_prediction(row, acad_col, tvl_col):
-    # Safely get values, handling None columns
-    try:
-        if acad_col and acad_col in row.index:
-            a = float(row.get(acad_col, 0) or 0)
-        else:
-            a = 0.0
-    except (ValueError, TypeError):
-        a = 0.0
-    
-    try:
-        if tvl_col and tvl_col in row.index:
-            t = float(row.get(tvl_col, 0) or 0)
-        else:
-            t = 0.0
-    except (ValueError, TypeError):
-        t = 0.0
-    
-    # If both columns are missing or both are 0, try to infer from other columns
-    if (acad_col is None or tvl_col is None) or (a == 0 and t == 0):
-        # Try to find academic/techpro scores in other column names
-        row_cols = list(row.index) if hasattr(row, 'index') else list(row.keys())
-        for col in row_cols:
-            col_lower = str(col).lower()
-            if a == 0 and ('academic' in col_lower or 'acad' in col_lower):
-                try:
-                    a = float(row.get(col, 0) or 0)
-                except (ValueError, TypeError):
-                    pass
-            if t == 0 and ('technical' in col_lower or 'tvl' in col_lower or 'techpro' in col_lower):
-                try:
-                    t = float(row.get(col, 0) or 0)
-                except (ValueError, TypeError):
-                    pass
+    a = float(row.get(acad_col, 0) or 0)
+    t = float(row.get(tvl_col, 0) or 0)
     
     diff = a - t
     # Very tight margin for "Undecided" - only when scores are extremely close (within 0.2)
     neutral_margin = 0.2
-    
-    # If both scores are still 0 or very low, try to infer from other data before defaulting
-    if a == 0 and t == 0:
-        # Try to find any academic or technical indicators in the row
-        row_cols = list(row.index) if hasattr(row, 'index') else list(row.keys())
-        academic_sum = 0
-        techpro_sum = 0
-        
-        for col in row_cols:
-            col_lower = str(col).lower()
-            try:
-                val = float(row.get(col, 0) or 0)
-                if val > 0:
-                    if any(keyword in col_lower for keyword in ['math', 'science', 'english', 'academic', 'acad']):
-                        academic_sum += val
-                    elif any(keyword in col_lower for keyword in ['tle', 'technical', 'tvl', 'techpro', 'tech pro']):
-                        techpro_sum += val
-            except (ValueError, TypeError):
-                pass
-        
-        # If we found any indicators, use them
-        if academic_sum > techpro_sum and academic_sum > 0:
-            return "Academic", min(0.65, 0.50 + academic_sum / 30)
-        elif techpro_sum > academic_sum and techpro_sum > 0:
-            return "TechPro", min(0.65, 0.50 + techpro_sum / 30)
-        # Only default to Undecided if truly no data
-        return "Undecided", 0.50
     
     # Check if scores are truly neutral (very close)
     if abs(diff) <= neutral_margin:
@@ -238,23 +180,20 @@ def find_label_columns(df):
 
     acad_candidates = [cols[i] for i, c in enumerate(low)
                        if "academic track" in c
-                       or ("academic" in c and "track" in c)
-                       or ("academic" in c and "score" in c)]
+                       or ("academic" in c and "track" in c)]
     tech_candidates = [cols[i] for i, c in enumerate(low)
                        if "technical-professional" in c
                        or "technical professional" in c
                        or ("technical" in c and "track" in c)
-                       or "technical-professional track" in c
-                       or ("technical" in c and "score" in c)
-                       or ("tvl" in c and "score" in c)]
+                       or "technical-professional track" in c]
 
     # Broader search if not found
     if not acad_candidates:
         acad_candidates = [cols[i] for i, c in enumerate(low) 
-                          if "academic" in c or "acad" in c]
+                          if "academic" in c]
     if not tech_candidates:
         tech_candidates = [cols[i] for i, c in enumerate(low) 
-                          if "technical" in c or "tvl" in c or "techpro" in c or "tech pro" in c]
+                          if "technical" in c or "tvl" in c]
 
     return acad_candidates, tech_candidates
 
@@ -654,12 +593,6 @@ def run_prediction_mode(input_csv_path: str) -> int:
     acad_candidates, tvl_candidates = find_label_columns(df_in)
     acad_col = acad_candidates[0] if acad_candidates else None
     tvl_col = tvl_candidates[0] if tvl_candidates else None
-    
-    # Debug: Print detected columns
-    print(f"DEBUG: Detected academic column: {acad_col}", file=sys.stderr)
-    print(f"DEBUG: Detected techpro column: {tvl_col}", file=sys.stderr)
-    if acad_col is None or tvl_col is None:
-        print(f"DEBUG: Warning - Missing label columns. Available columns: {list(df_in.columns)}", file=sys.stderr)
 
     # Helpers to fetch common fields with flexible header names
     def pick_case_insensitive(row_like, candidates):
@@ -780,22 +713,18 @@ def run_prediction_mode(input_csv_path: str) -> int:
                     predicted = labels[idx_max]
                     confidence = float(np.max(proba))
                     
-                    # Always prefer Academic or TechPro over Undecided unless truly balanced
-                    acad_idx = labels.index("Academic") if "Academic" in labels else -1
-                    techpro_idx = labels.index("TechPro") if "TechPro" in labels else -1
-                    undecided_idx = labels.index("Undecided") if "Undecided" in labels else -1
-                    
-                    if acad_idx >= 0 and techpro_idx >= 0:
-                        acad_prob = proba[acad_idx]
-                        techpro_prob = proba[techpro_idx]
-                        undecided_prob = proba[undecided_idx] if undecided_idx >= 0 else 0.0
-                        prob_diff = abs(acad_prob - techpro_prob)
+                    # Only keep "Undecided" if probabilities are truly close (within 5%)
+                    if predicted == "Undecided":
+                        acad_idx = labels.index("Academic") if "Academic" in labels else -1
+                        techpro_idx = labels.index("TechPro") if "TechPro" in labels else -1
                         
-                        # Only use Undecided if:
-                        # 1. Undecided has the highest probability AND
-                        # 2. Academic and TechPro probabilities are very close (within 3%)
-                        if predicted == "Undecided":
-                            if prob_diff > 0.03:  # More aggressive threshold (3% instead of 5%)
+                        if acad_idx >= 0 and techpro_idx >= 0:
+                            acad_prob = proba[acad_idx]
+                            techpro_prob = proba[techpro_idx]
+                            prob_diff = abs(acad_prob - techpro_prob)
+                            
+                            # Only keep Undecided if probabilities are very close (within 0.05 = 5%)
+                            if prob_diff > 0.05:
                                 # Pick the one with higher probability
                                 if acad_prob > techpro_prob:
                                     predicted = "Academic"
@@ -803,24 +732,7 @@ def run_prediction_mode(input_csv_path: str) -> int:
                                 else:
                                     predicted = "TechPro"
                                     confidence = float(techpro_prob)
-                            # If prob_diff <= 0.03, keep "Undecided" (truly neutral)
-                        elif undecided_prob > max(acad_prob, techpro_prob):
-                            # If Undecided somehow has highest prob but wasn't selected, override
-                            if prob_diff > 0.03:
-                                if acad_prob > techpro_prob:
-                                    predicted = "Academic"
-                                    confidence = float(acad_prob)
-                                else:
-                                    predicted = "TechPro"
-                                    confidence = float(techpro_prob)
-                    
-                    # Final check: if still Undecided, try simple rule as backup
-                    if predicted == "Undecided" and (acad_col or tvl_col):
-                        backup_predicted, backup_confidence = simple_rule_prediction(row, acad_col, tvl_col)
-                        if backup_predicted != "Undecided":
-                            predicted = backup_predicted
-                            confidence = backup_confidence
-                            print(f"DEBUG: Overrode Undecided with {backup_predicted} using simple rule for row {idx}", file=sys.stderr)
+                            # If prob_diff <= 0.05, keep "Undecided" (truly neutral)
             except Exception as e:
                 print(f"DEBUG: Model prediction failed for row {idx}: {str(e)}", file=sys.stderr)
                 predicted = None
@@ -834,36 +746,7 @@ def run_prediction_mode(input_csv_path: str) -> int:
             elif predicted == "TechPro":
                 all_probabilities = {'Academic': 1 - confidence, 'TechPro': confidence, 'Undecided': 0.0}
             else:
-                # If fallback returns Undecided, try to infer from row data
-                # Look for any indicators that suggest Academic or TechPro preference
-                row_cols = list(row.index) if hasattr(row, 'index') else list(row.keys())
-                academic_indicators = 0
-                techpro_indicators = 0
-                
-                for col in row_cols:
-                    col_lower = str(col).lower()
-                    try:
-                        val = float(row.get(col, 0) or 0)
-                        if val >= 3:  # Meaningful score
-                            if 'math' in col_lower or 'science' in col_lower or 'english' in col_lower or 'academic' in col_lower:
-                                academic_indicators += val
-                            elif 'tle' in col_lower or 'technical' in col_lower or 'tvl' in col_lower or 'techpro' in col_lower:
-                                techpro_indicators += val
-                    except (ValueError, TypeError):
-                        pass
-                
-                # If we found indicators, use them to decide
-                if academic_indicators > techpro_indicators and academic_indicators > 0:
-                    predicted = "Academic"
-                    confidence = min(0.70, 0.55 + (academic_indicators - techpro_indicators) / 20)
-                    all_probabilities = {'Academic': confidence, 'TechPro': 1 - confidence, 'Undecided': 0.0}
-                elif techpro_indicators > academic_indicators and techpro_indicators > 0:
-                    predicted = "TechPro"
-                    confidence = min(0.70, 0.55 + (techpro_indicators - academic_indicators) / 20)
-                    all_probabilities = {'Academic': 1 - confidence, 'TechPro': confidence, 'Undecided': 0.0}
-                else:
-                    all_probabilities = {'Academic': 0.33, 'TechPro': 0.33, 'Undecided': 0.34}
-            
+                all_probabilities = {'Academic': 0.33, 'TechPro': 0.33, 'Undecided': 0.34}
             proba_array = [all_probabilities.get('Academic', 0), all_probabilities.get('TechPro', 0), all_probabilities.get('Undecided', 0)]
         
         strand_breakdown = generate_strand_breakdown(predicted)
