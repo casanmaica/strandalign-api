@@ -133,24 +133,25 @@ def simple_rule_prediction(row, acad_col, tvl_col):
     t = float(row.get(tvl_col, 0) or 0)
     
     diff = a - t
-    # Very tight margin for "Undecided" - only when scores are extremely close (within 0.2)
-    neutral_margin = 0.2
+    # Very tight margin for "Undecided" - only when scores are extremely close (within 0.1)
+    neutral_margin = 0.1  # Reduced from 0.2 to be more decisive
     
     # Check if scores are truly neutral (very close)
     if abs(diff) <= neutral_margin:
-        # Only use Undecided if both scores are meaningful (>= 2.5) or both are low
-        if (a >= 2.5 and t >= 2.5) or (a < 2.5 and t < 2.5):
+        # Only use Undecided if both scores are high (>= 3.0) AND extremely close
+        # For low scores or when one is clearly better, always pick a track
+        if a >= 3.0 and t >= 3.0 and abs(diff) <= 0.05:
+            # Both high and truly equal - use Undecided
             label = "Undecided"
-            # Low confidence for truly neutral cases
             conf = max(0.50, min(0.60, 0.5 + abs(diff) * 0.5))
         else:
-            # Even if close, if one is clearly above threshold, pick it
-            if a > t:
+            # Always pick a track - prefer the higher one, even if close
+            if a >= t:
                 label = "Academic"
-                conf = max(0.55, min(0.70, 0.5 + diff / 5))
+                conf = max(0.55, min(0.75, 0.5 + abs(diff) * 2))
             else:
                 label = "TechPro"
-                conf = max(0.55, min(0.70, 0.5 + abs(diff) / 5))
+                conf = max(0.55, min(0.75, 0.5 + abs(diff) * 2))
     else:
         # Clear preference - pick the higher score
         if diff > neutral_margin:
@@ -713,18 +714,22 @@ def run_prediction_mode(input_csv_path: str) -> int:
                     predicted = labels[idx_max]
                     confidence = float(np.max(proba))
                     
-                    # Only keep "Undecided" if probabilities are truly close (within 5%)
-                    if predicted == "Undecided":
-                        acad_idx = labels.index("Academic") if "Academic" in labels else -1
-                        techpro_idx = labels.index("TechPro") if "TechPro" in labels else -1
+                    # Always prefer Academic or TechPro over Undecided unless truly equal
+                    # Check if we can convert Undecided to a more specific prediction
+                    acad_idx = labels.index("Academic") if "Academic" in labels else -1
+                    techpro_idx = labels.index("TechPro") if "TechPro" in labels else -1
+                    undecided_idx = labels.index("Undecided") if "Undecided" in labels else -1
+                    
+                    if acad_idx >= 0 and techpro_idx >= 0:
+                        acad_prob = proba[acad_idx]
+                        techpro_prob = proba[techpro_idx]
+                        undecided_prob = proba[undecided_idx] if undecided_idx >= 0 else 0.0
                         
-                        if acad_idx >= 0 and techpro_idx >= 0:
-                            acad_prob = proba[acad_idx]
-                            techpro_prob = proba[techpro_idx]
+                        # If model predicted Undecided, check if we should override it
+                        if predicted == "Undecided":
+                            # Only keep Undecided if Academic and TechPro probabilities are extremely close (within 2%)
                             prob_diff = abs(acad_prob - techpro_prob)
-                            
-                            # Only keep Undecided if probabilities are very close (within 0.05 = 5%)
-                            if prob_diff > 0.05:
+                            if prob_diff > 0.02:  # More aggressive: 2% threshold instead of 5%
                                 # Pick the one with higher probability
                                 if acad_prob > techpro_prob:
                                     predicted = "Academic"
@@ -732,22 +737,45 @@ def run_prediction_mode(input_csv_path: str) -> int:
                                 else:
                                     predicted = "TechPro"
                                     confidence = float(techpro_prob)
-                            # If prob_diff <= 0.05, keep "Undecided" (truly neutral)
+                            # If prob_diff <= 0.02, keep "Undecided" (truly neutral)
+                        # If model predicted Academic or TechPro but Undecided has higher prob, still keep the prediction
+                        # (This handles edge cases where model might have unusual class ordering)
             except Exception as e:
                 print(f"DEBUG: Model prediction failed for row {idx}: {str(e)}", file=sys.stderr)
                 predicted = None
         
         # Fallback to simple rule if model failed
         if predicted is None:
-            predicted, confidence = simple_rule_prediction(row, acad_col, tvl_col)
-            # Create basic probability estimates for fallback
-            if predicted == "Academic":
-                all_probabilities = {'Academic': confidence, 'TechPro': 1 - confidence, 'Undecided': 0.0}
-            elif predicted == "TechPro":
-                all_probabilities = {'Academic': 1 - confidence, 'TechPro': confidence, 'Undecided': 0.0}
+            # Only use simple rule if we have the required columns
+            if acad_col and tvl_col:
+                predicted, confidence = simple_rule_prediction(row, acad_col, tvl_col)
+                # Create basic probability estimates for fallback
+                if predicted == "Academic":
+                    all_probabilities = {'Academic': confidence, 'TechPro': 1 - confidence, 'Undecided': 0.0}
+                elif predicted == "TechPro":
+                    all_probabilities = {'Academic': 1 - confidence, 'TechPro': confidence, 'Undecided': 0.0}
+                else:
+                    # Even for Undecided in simple rule, try to prefer one track
+                    a = float(row.get(acad_col, 0) or 0)
+                    t = float(row.get(tvl_col, 0) or 0)
+                    if a > t:
+                        predicted = "Academic"
+                        confidence = 0.55
+                        all_probabilities = {'Academic': 0.55, 'TechPro': 0.35, 'Undecided': 0.10}
+                    elif t > a:
+                        predicted = "TechPro"
+                        confidence = 0.55
+                        all_probabilities = {'Academic': 0.35, 'TechPro': 0.55, 'Undecided': 0.10}
+                    else:
+                        all_probabilities = {'Academic': 0.40, 'TechPro': 0.40, 'Undecided': 0.20}
+                proba_array = [all_probabilities.get('Academic', 0), all_probabilities.get('TechPro', 0), all_probabilities.get('Undecided', 0)]
             else:
-                all_probabilities = {'Academic': 0.33, 'TechPro': 0.33, 'Undecided': 0.34}
-            proba_array = [all_probabilities.get('Academic', 0), all_probabilities.get('TechPro', 0), all_probabilities.get('Undecided', 0)]
+                # If columns not found, default to a reasonable prediction
+                print(f"DEBUG: Academic/TechPro columns not found, using default prediction", file=sys.stderr)
+                predicted = "Academic"  # Default to Academic if we can't determine
+                confidence = 0.50
+                all_probabilities = {'Academic': 0.50, 'TechPro': 0.40, 'Undecided': 0.10}
+                proba_array = [0.50, 0.40, 0.10]
         
         strand_breakdown = generate_strand_breakdown(predicted)
         
