@@ -752,16 +752,20 @@ def run_prediction_mode(input_csv_path: str) -> int:
     csv_out = os.path.join(EXCEL_DIR, 'student_predictions.csv')
     xlsx_out = os.path.join(EXCEL_DIR, 'student_predictions.xlsx')
     
-    # Save CSV and XLSX (excluding student_name, student_n, gmail, email, and strand_breakdown)
+    # Only include these specific columns: student_id, gender, age, grade_section, recommended_track, confidence
     df_out = pd.DataFrame(results)
-    columns_to_drop = ['student_name', 'student_n', 'gmail', 'email', 'strand_breakdown']
-    cols_to_drop = []
-    for col in df_out.columns:
-        col_lower = str(col).lower()
-        if any(excluded_col.lower() in col_lower for excluded_col in columns_to_drop):
-            cols_to_drop.append(col)
-    if cols_to_drop:
-        df_out = df_out.drop(columns=cols_to_drop)
+    required_columns = ['student_id', 'gender', 'age', 'grade_section', 'predicted_track', 'confidence']
+    
+    # Select only the required columns (if they exist in the dataframe)
+    available_columns = [col for col in required_columns if col in df_out.columns]
+    if available_columns:
+        df_out = df_out[available_columns]
+        # Rename predicted_track to recommended_track for CSV output
+        if 'predicted_track' in df_out.columns:
+            df_out = df_out.rename(columns={'predicted_track': 'recommended_track'})
+    else:
+        # Fallback: create empty dataframe with required columns if none exist
+        df_out = pd.DataFrame(columns=['student_id', 'gender', 'age', 'grade_section', 'recommended_track', 'confidence'])
     
     df_out.to_csv(csv_out, index=False)
     # Save XLSX
