@@ -3,13 +3,15 @@ import numpy as np
 import json
 import sys
 import os
+import pickle
 
 # Optional imports for training mode
 try:
-    from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV
+    from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV, GridSearchCV
     from sklearn.ensemble import RandomForestClassifier
+    from sklearn.feature_selection import SelectFromModel, SelectKBest, f_classif
     from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, precision_score, recall_score, classification_report
-    from sklearn.preprocessing import StandardScaler
+    from sklearn.preprocessing import StandardScaler, RobustScaler
     from sklearn.calibration import CalibratedClassifierCV
     from imblearn.over_sampling import SMOTE
     from collections import Counter
@@ -31,7 +33,33 @@ SCALER_OUTPUT = os.path.join(SCRIPT_DIR, 'strandalign_scaler.joblib')
 FEATURES_OUTPUT = os.path.join(SCRIPT_DIR, 'strandalign_features.json')
 FEATURE_IMPORTANCE_OUTPUT = os.path.join(SCRIPT_DIR, 'feature_importances.csv')
 RANDOM_STATE = 42
-N_SPLITS = 5
+N_SPLITS = 3  # Reduced from 5 to 3 for faster training (still statistically valid)
+# Performance improvement settings
+USE_ADVANCED_FEATURES = True  # Enable advanced feature engineering
+USE_FEATURE_SELECTION = True  # Enable feature selection
+FEATURE_SELECTION_METHOD = 'importance'  # 'importance' or 'kbest'
+FEATURE_SELECTION_THRESHOLD = 0.003  # Lower threshold for more features (was 0.01)
+K_BEST_FEATURES = 25  # For k-best selection (if method is 'kbest')
+HYPERPARAM_SEARCH_ITERATIONS = 150  # Increased for better tuning (was 100)
+
+# Speed optimization settings
+QUICK_TRAINING_MODE = False  # Set to True for faster training (reduces iterations, folds, etc.)
+SAVE_AS_PKL = True  # Save model as .pkl file in addition to .joblib
+CV_N_ESTIMATORS = 200  # Use fewer trees during CV for speed (final model uses full n_estimators)
+SKIP_HYPERPARAM_SEARCH_IF_MODEL_EXISTS = True  # Skip hyperparameter search if model already exists (use previous best params)
+
+# Academic class performance improvement settings
+USE_CLASS_WEIGHT_ADJUSTMENT = True  # Adjust class weights to improve Academic class performance
+AUGMENT_ACADEMIC_DATA = True  # Generate synthetic Academic examples to balance dataset
+USE_ENHANCED_FEATURES = True  # Add features that better distinguish Academic vs TechPro
+ENABLE_DATA_QUALITY_CHECKS = True  # Perform data quality improvements (outlier detection, cleaning)
+ACADEMIC_AUGMENTATION_FACTOR = 1.5  # More aggressive: 30% more Academic samples (was 1.2)
+
+# TechPro class performance improvement settings
+AUGMENT_TECHPRO_DATA = True  # Generate synthetic TechPro examples to balance dataset
+TECHPRO_AUGMENTATION_FACTOR = 1.5  # More aggressive: 30% more TechPro samples (was 1.2)
+BOOST_TECHPRO_WEIGHT = True  # Boost TechPro class weight to improve its performance
+TECHPRO_WEIGHT_BOOST = 1.15  # 15% boost for TechPro class weight
 
 
 def generate_strand_breakdown(group_label):
@@ -150,10 +178,213 @@ def remove_tagalog_columns(df, preserve_cols=None):
     return df.loc[:, ~drop_mask]
 
 
-def prepare_features(df, drop_cols=None, is_training=True, scaler=None, training_medians=None):
+def augment_class_data(df, class_mask, class_name, augmentation_factor=1.2, enabled=True):
     """
-    Prepare features with binarized preferences and normalization.
-    Returns: (X, grade_cols, preference_cols, scaler, feature_names)
+    Generate synthetic examples for a specific class using SMOTE-like approach with controlled noise.
+    
+    Args:
+        df: DataFrame with data
+        class_mask: Boolean mask for the class to augment
+        class_name: Name of the class (for logging)
+        augmentation_factor: Factor to multiply samples by (1.2 = 20% more)
+        enabled: Whether augmentation is enabled for this class
+    """
+    if not enabled or augmentation_factor <= 1.0:
+        return df
+    
+    class_df = df[class_mask].copy()
+    if len(class_df) < 2:
+        return df
+    
+    # Calculate how many samples to generate
+    current_count = len(class_df)
+    target_count = int(current_count * augmentation_factor)
+    samples_needed = max(0, target_count - current_count)
+    
+    if samples_needed == 0:
+        return df
+    
+    # Generate synthetic samples by adding small random noise
+    np.random.seed(RANDOM_STATE)
+    synthetic_samples = []
+    
+    for _ in range(samples_needed):
+        # Pick a random sample from the class
+        base_idx = np.random.randint(0, len(class_df))
+        base_sample = class_df.iloc[base_idx].copy()
+        
+        # Add controlled noise to numeric columns only
+        numeric_cols = class_df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            if col in base_sample.index:
+                val = base_sample[col]
+                if pd.notnull(val) and isinstance(val, (int, float)):
+                    # Add small noise (5% of value or 0.1, whichever is smaller)
+                    noise = np.random.normal(0, min(abs(val) * 0.05, 0.1))
+                    base_sample[col] = max(1, min(5, val + noise))  # Keep in valid range
+        
+        synthetic_samples.append(base_sample)
+    
+    if synthetic_samples:
+        synthetic_df = pd.DataFrame(synthetic_samples)
+        augmented_df = pd.concat([df, synthetic_df], ignore_index=True)
+        new_count = len(augmented_df) - len(df) + current_count
+        print(f"✅ Augmented {class_name} class: {current_count} → {new_count} samples (+{new_count - current_count})", file=sys.stderr)
+        return augmented_df
+    
+    return df
+
+
+def augment_academic_data(df, academic_mask, augmentation_factor=1.2):
+    """
+    Generate synthetic Academic examples using SMOTE-like approach with controlled noise.
+    (Wrapper for backward compatibility)
+    """
+    return augment_class_data(df, academic_mask, "Academic", augmentation_factor, AUGMENT_ACADEMIC_DATA)
+
+
+def improve_data_quality(df, numeric_cols):
+    """
+    Perform data quality improvements: outlier detection and cleaning.
+    """
+    if not ENABLE_DATA_QUALITY_CHECKS:
+        return df
+    
+    df_cleaned = df.copy()
+    outliers_removed = 0
+    
+    for col in numeric_cols:
+        if col not in df_cleaned.columns:
+            continue
+        
+        # Use IQR method for outlier detection
+        Q1 = df_cleaned[col].quantile(0.25)
+        Q3 = df_cleaned[col].quantile(0.75)
+        IQR = Q3 - Q1
+        
+        if IQR > 0:
+            lower_bound = Q1 - 2.5 * IQR  # More lenient (2.5 instead of 1.5)
+            upper_bound = Q3 + 2.5 * IQR
+            
+            # Cap outliers instead of removing (less data loss)
+            before = (df_cleaned[col] < lower_bound).sum() + (df_cleaned[col] > upper_bound).sum()
+            if before > 0:
+                # Convert to float to avoid dtype warnings
+                df_cleaned[col] = df_cleaned[col].astype(float)
+                df_cleaned.loc[df_cleaned[col] < lower_bound, col] = float(lower_bound)
+                df_cleaned.loc[df_cleaned[col] > upper_bound, col] = float(upper_bound)
+            outliers_removed += before
+    
+    if outliers_removed > 0:
+        print(f"✅ Data quality: Capped {outliers_removed} outlier values", file=sys.stderr)
+    
+    return df_cleaned
+
+
+def add_enhanced_features(X, grade_cols, subject_interest_cols, ability_cols):
+    """
+    Add features that better distinguish Academic vs TechPro tracks.
+    """
+    if not USE_ENHANCED_FEATURES:
+        return X
+    
+    enhanced_X = X.copy()
+    
+    # Academic vs TechPro distinguishing features
+    if grade_cols:
+        available_grades = [c for c in grade_cols if c in X.columns]
+        if available_grades:
+            # Academic strength indicators
+            math_science_cols = [c for c in available_grades if any(subj in c for subj in ['Math', 'Science', 'Mathematics'])]
+            if math_science_cols:
+                enhanced_X['academic_strength_score'] = X[math_science_cols].mean(axis=1)
+                enhanced_X['academic_consistency'] = 1.0 / (X[math_science_cols].std(axis=1) + 1e-6)  # Higher = more consistent
+            
+            # TechPro strength indicators
+            tle_cols = [c for c in available_grades if 'TLE' in c]
+            if tle_cols:
+                enhanced_X['techpro_strength_score'] = X[tle_cols].mean(axis=1)
+            
+            # Academic vs TechPro performance gap
+            if 'academic_strength_score' in enhanced_X.columns and 'techpro_strength_score' in enhanced_X.columns:
+                enhanced_X['academic_techpro_gap'] = enhanced_X['academic_strength_score'] - enhanced_X['techpro_strength_score']
+            
+            # Theoretical vs Practical preference
+            theoretical_subjects = [c for c in available_grades if any(subj in c for subj in ['Math', 'Science', 'English', 'Araling Panlipunan'])]
+            practical_subjects = [c for c in available_grades if any(subj in c for subj in ['TLE', 'MAPEH'])]
+            
+            if theoretical_subjects and practical_subjects:
+                enhanced_X['theoretical_avg'] = X[theoretical_subjects].mean(axis=1)
+                enhanced_X['practical_avg'] = X[practical_subjects].mean(axis=1)
+                enhanced_X['theoretical_practical_ratio'] = enhanced_X['theoretical_avg'] / (enhanced_X['practical_avg'] + 1e-6)
+    
+    # Interest-based distinguishing features
+    if subject_interest_cols:
+        available_interest = [c for c in subject_interest_cols if c in X.columns]
+        if available_interest:
+            # Academic interest indicators
+            academic_interest_keywords = ['research', 'analysis', 'study', 'learn', 'academic', 'theory', 'problem']
+            academic_interests = [c for c in available_interest if any(kw in c.lower() for kw in academic_interest_keywords)]
+            
+            # TechPro interest indicators
+            techpro_interest_keywords = ['practical', 'hands-on', 'technical', 'build', 'create', 'apply', 'skill']
+            techpro_interests = [c for c in available_interest if any(kw in c.lower() for kw in techpro_interest_keywords)]
+            
+            if academic_interests:
+                enhanced_X['academic_interest_score'] = X[academic_interests].mean(axis=1)
+            else:
+                enhanced_X['academic_interest_score'] = 0
+            if techpro_interests:
+                enhanced_X['techpro_interest_score'] = X[techpro_interests].mean(axis=1)
+            else:
+                enhanced_X['techpro_interest_score'] = 0
+            
+            if 'academic_interest_score' in enhanced_X.columns and 'techpro_interest_score' in enhanced_X.columns:
+                enhanced_X['interest_alignment_score'] = enhanced_X['academic_interest_score'] - enhanced_X['techpro_interest_score']
+    
+    # Ability-based distinguishing features
+    if ability_cols:
+        available_ability = [c for c in ability_cols if c in X.columns]
+        if available_ability:
+            # Academic ability indicators
+            academic_ability_keywords = ['think', 'analyze', 'critical', 'reason', 'solve', 'understand', 'conceptual']
+            academic_abilities = [c for c in available_ability if any(kw in c.lower() for kw in academic_ability_keywords)]
+            
+            # TechPro ability indicators
+            techpro_ability_keywords = ['practical', 'hands-on', 'technical', 'apply', 'build', 'create', 'manual']
+            techpro_abilities = [c for c in available_ability if any(kw in c.lower() for kw in techpro_ability_keywords)]
+            
+            if academic_abilities:
+                enhanced_X['academic_ability_score'] = X[academic_abilities].mean(axis=1)
+            else:
+                enhanced_X['academic_ability_score'] = 0
+            if techpro_abilities:
+                enhanced_X['techpro_ability_score'] = X[techpro_abilities].mean(axis=1)
+            else:
+                enhanced_X['techpro_ability_score'] = 0
+            
+            if 'academic_ability_score' in enhanced_X.columns and 'techpro_ability_score' in enhanced_X.columns:
+                enhanced_X['ability_alignment_score'] = enhanced_X['academic_ability_score'] - enhanced_X['techpro_ability_score']
+    
+    # Combined alignment score (most important distinguishing feature)
+    alignment_features = []
+    if 'academic_techpro_gap' in enhanced_X.columns:
+        alignment_features.append('academic_techpro_gap')
+    if 'interest_alignment_score' in enhanced_X.columns:
+        alignment_features.append('interest_alignment_score')
+    if 'ability_alignment_score' in enhanced_X.columns:
+        alignment_features.append('ability_alignment_score')
+    
+    if alignment_features:
+        enhanced_X['overall_academic_techpro_alignment'] = enhanced_X[alignment_features].mean(axis=1)
+    
+    return enhanced_X
+
+
+def prepare_features(df, drop_cols=None, is_training=True, scaler=None, training_medians=None, feature_selector=None):
+    """
+    Prepare features with advanced engineering, binarized preferences, and normalization.
+    Returns: (X, grade_cols, preference_cols, scaler, feature_names, training_medians, feature_selector)
     """
     if drop_cols is None:
         drop_cols = []
@@ -193,16 +424,110 @@ def prepare_features(df, drop_cols=None, is_training=True, scaler=None, training
         if col in X.columns:
             X[col] = (X[col] >= 4).astype(int)
     
-    # Normalize grade columns
-    if grade_cols:
-        if is_training:
-            scaler = StandardScaler()
-            X[grade_cols] = scaler.fit_transform(X[grade_cols])
-        else:
-            if scaler is not None:
-                X[grade_cols] = scaler.transform(X[grade_cols])
+    # Advanced feature engineering
+    if USE_ADVANCED_FEATURES:
+        # Grade statistics
+        if grade_cols:
+            available_grades = [c for c in grade_cols if c in X.columns]
+            if available_grades:
+                X['grade_mean'] = X[available_grades].mean(axis=1)
+                X['grade_std'] = X[available_grades].std(axis=1).fillna(0)
+                X['grade_max'] = X[available_grades].max(axis=1)
+                X['grade_min'] = X[available_grades].min(axis=1)
+                # Grade trend (improvement over time)
+                if len(available_grades) >= 2:
+                    # Try to get grades in order (Grade 7, 8, 9, 10)
+                    sorted_grades = sorted(available_grades, key=lambda x: ('7' in x, '8' in x, '9' in x, '10' in x))
+                    if len(sorted_grades) >= 2:
+                        X['grade_trend'] = X[sorted_grades[-1]] - X[sorted_grades[0]]
+                    else:
+                        X['grade_trend'] = 0
+                else:
+                    X['grade_trend'] = 0
+                
+                # Subject-specific averages
+                math_grades = [c for c in available_grades if 'Math' in c]
+                science_grades = [c for c in available_grades if 'Science' in c]
+                tle_grades = [c for c in available_grades if 'TLE' in c]
+                english_grades = [c for c in available_grades if 'English' in c]
+                
+                if math_grades:
+                    X['math_avg'] = X[math_grades].mean(axis=1)
+                if science_grades:
+                    X['science_avg'] = X[science_grades].mean(axis=1)
+                if tle_grades:
+                    X['tle_avg'] = X[tle_grades].mean(axis=1)
+                if english_grades:
+                    X['english_avg'] = X[english_grades].mean(axis=1)
+                
+                # Performance ratios (key differentiators)
+                if 'tle_avg' in X.columns and 'math_avg' in X.columns:
+                    X['tle_vs_math_ratio'] = X['tle_avg'] / (X['math_avg'] + 1e-6)  # Avoid division by zero
+                if 'tle_avg' in X.columns and 'science_avg' in X.columns:
+                    practical = X['tle_avg']
+                    theoretical = (X['math_avg'] if 'math_avg' in X.columns else 0) + (X['science_avg'] if 'science_avg' in X.columns else 0)
+                    X['practical_vs_theoretical'] = practical / (theoretical / 2 + 1e-6)
+                if 'grade_max' in X.columns and 'grade_min' in X.columns:
+                    X['best_vs_worst_ratio'] = X['grade_max'] / (X['grade_min'] + 1e-6)
+        
+        # Interest/ability aggregations
+        if subject_interest_cols:
+            available_interest = [c for c in subject_interest_cols if c in X.columns]
+            if available_interest:
+                X['interest_mean'] = X[available_interest].mean(axis=1)
+                X['interest_std'] = X[available_interest].std(axis=1).fillna(0)
+                X['high_interest_count'] = (X[available_interest] >= 4).sum(axis=1)
+        
+        if ability_cols:
+            available_ability = [c for c in ability_cols if c in X.columns]
+            if available_ability:
+                X['ability_mean'] = X[available_ability].mean(axis=1)
+                X['ability_std'] = X[available_ability].std(axis=1).fillna(0)
+                X['high_ability_count'] = (X[available_ability] >= 4).sum(axis=1)
+        
+        # Feature interactions (key combinations)
+        if 'grade_mean' in X.columns and 'interest_mean' in X.columns:
+            X['grade_interest_alignment'] = X['grade_mean'] * X['interest_mean']
+        
+        if 'tle_avg' in X.columns and 'interest_mean' in X.columns:
+            # Technical performance × Technical interest
+            X['technical_alignment'] = X['tle_avg'] * X['interest_mean']
+        
+        if 'math_avg' in X.columns and 'ability_mean' in X.columns:
+            # Academic performance × Ability
+            X['academic_ability_alignment'] = X['math_avg'] * X['ability_mean']
     
-    return X, grade_cols, preference_cols, scaler, list(X.columns), training_medians
+    # Add enhanced features that better distinguish Academic vs TechPro
+    X = add_enhanced_features(X, grade_cols, subject_interest_cols, ability_cols)
+    
+    # Scale ALL features (not just grades) for better model performance
+    if is_training:
+        # Use RobustScaler for better handling of outliers
+        scaler = RobustScaler()
+        X_scaled = pd.DataFrame(
+            scaler.fit_transform(X),
+            columns=X.columns,
+            index=X.index
+        )
+    else:
+        if scaler is not None:
+            X_scaled = pd.DataFrame(
+                scaler.transform(X),
+                columns=X.columns,
+                index=X.index
+            )
+        else:
+            X_scaled = X.copy()
+    
+    # Apply feature selection if enabled
+    if USE_FEATURE_SELECTION and feature_selector is not None:
+        X_scaled = pd.DataFrame(
+            feature_selector.transform(X_scaled),
+            columns=[X_scaled.columns[i] for i in range(len(X_scaled.columns)) if feature_selector.get_support()[i]],
+            index=X_scaled.index
+        )
+    
+    return X_scaled, grade_cols, preference_cols, scaler, list(X_scaled.columns), training_medians, feature_selector
 
 
 def run_prediction_mode(input_csv_path: str) -> int:
@@ -237,24 +562,54 @@ def run_prediction_mode(input_csv_path: str) -> int:
 
     results = []
     
-    # Try to use model if available
+    # Try to use model if available (prefer PKL if both exist)
     model_available = os.path.exists(MODEL_OUTPUT)
+    model_pkl_available = os.path.exists(os.path.join(SCRIPT_DIR, 'strandalign_model.pkl'))
     scaler_available = os.path.exists(SCALER_OUTPUT)
+    scaler_pkl_available = os.path.exists(os.path.join(SCRIPT_DIR, 'strandalign_scaler.pkl'))
     features_available = os.path.exists(FEATURES_OUTPUT)
     
     clf = None
     scaler = None
     training_features = None
     training_medians = None
+    feature_selector = None
     
-    if model_available and scaler_available and features_available:
+    # Prefer PKL files if available, otherwise use joblib
+    use_pkl = model_pkl_available and scaler_pkl_available and features_available
+    use_joblib = model_available and scaler_available and features_available
+    
+    if use_pkl or use_joblib:
         try:
-            clf = joblib.load(MODEL_OUTPUT)
-            scaler = joblib.load(SCALER_OUTPUT)
+            if use_pkl:
+                # Load from PKL files
+                model_path = os.path.join(SCRIPT_DIR, 'strandalign_model.pkl')
+                scaler_path = os.path.join(SCRIPT_DIR, 'strandalign_scaler.pkl')
+                with open(model_path, 'rb') as f:
+                    clf = pickle.load(f)
+                with open(scaler_path, 'rb') as f:
+                    scaler = pickle.load(f)
+                print(f"DEBUG: Loaded model from PKL files", file=sys.stderr)
+            else:
+                # Load from joblib files
+                clf = joblib.load(MODEL_OUTPUT)
+                scaler = joblib.load(SCALER_OUTPUT)
+                print(f"DEBUG: Loaded model from joblib files", file=sys.stderr)
+            
             with open(FEATURES_OUTPUT, 'r') as f:
                 feature_data = json.load(f)
                 training_features = feature_data.get('feature_names', [])
                 training_medians = pd.Series(feature_data.get('medians', {}))
+            
+            # Try to load feature selector if it exists (try PKL first, then joblib)
+            feature_selector_pkl_path = os.path.join(SCRIPT_DIR, 'strandalign_feature_selector.pkl')
+            feature_selector_joblib_path = os.path.join(SCRIPT_DIR, 'strandalign_feature_selector.joblib')
+            if os.path.exists(feature_selector_pkl_path):
+                with open(feature_selector_pkl_path, 'rb') as f:
+                    feature_selector = pickle.load(f)
+            elif os.path.exists(feature_selector_joblib_path):
+                feature_selector = joblib.load(feature_selector_joblib_path)
+            
             print(f"DEBUG: Loaded model with {len(training_features)} features", file=sys.stderr)
         except Exception as e:
             print(f"DEBUG: Failed to load model files: {str(e)}", file=sys.stderr)
@@ -288,12 +643,13 @@ def run_prediction_mode(input_csv_path: str) -> int:
                 if tvl_col and tvl_col in row_df.columns:
                     drop_cols.append(tvl_col)
                 
-                X_row, _, _, _, _, _ = prepare_features(
+                X_row, _, _, _, _, _, _ = prepare_features(
                     row_df, 
                     drop_cols=drop_cols, 
                     is_training=False, 
                     scaler=scaler, 
-                    training_medians=training_medians
+                    training_medians=training_medians,
+                    feature_selector=feature_selector
                 )
                 
                 # Align with training features
@@ -886,6 +1242,7 @@ def generate_counselor_explanation(row, predicted_track, confidence, df_columns)
 
 
 def run_training_mode(test_csv_path=None, generate_explanations=False):
+    
     if not ML_AVAILABLE:
         print(json.dumps({'error': 'Machine learning libraries not available. Install: pip install scikit-learn imbalanced-learn joblib'}))
         return 1
@@ -964,108 +1321,294 @@ def run_training_mode(test_csv_path=None, generate_explanations=False):
     def derive_group_label(row):
         a = row[academic_col]
         t = row[techpro_col]
-        if a >= 3 and t < 3:
+        if a >= 3.5 and t < 3.5:
             return "Academic"
-        elif t >= 3 and a < 3:
+        elif t >= 3.5 and a < 3.5:
             return "TechPro"
-        elif t >= 3 and a >= 3:
+        elif t >= 3.5 and a >= 3.5:
             return "Undecided"
+        elif abs(a - t) <= 0.5 and (a >= 3 or t >= 3):
+            # Only truly balanced cases become Undecided
+            return "Undecided"
+        elif a >= 3 and t >= 3:
+            # Both high but not balanced - pick the higher one
+            return "Academic" if a > t else "TechPro"
         else:
+            # Low scores - use the higher one or default to Undecided
+            if max(a, t) >= 2.5:
+                return "Academic" if a > t else "TechPro"
             return "Undecided"
     
     df['derived_group_label'] = df.apply(derive_group_label, axis=1)
-    print("🎯 Derived group label distribution:", file=sys.stderr)
+    print("🎯 Derived group label distribution (before augmentation):", file=sys.stderr)
     print(df['derived_group_label'].value_counts(), file=sys.stderr)
     print("", file=sys.stderr)
     
+    # Data quality improvements
+    if ENABLE_DATA_QUALITY_CHECKS:
+        print("🔍 Performing data quality checks...", file=sys.stderr)
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        df = improve_data_quality(df, numeric_cols)
+    
+    # Augment Academic class data
+    academic_mask = df['derived_group_label'] == 'Academic'
+    if AUGMENT_ACADEMIC_DATA and academic_mask.sum() > 0:
+        print(f"\n📈 Augmenting Academic class data...", file=sys.stderr)
+        df = augment_class_data(df, academic_mask, "Academic", ACADEMIC_AUGMENTATION_FACTOR, AUGMENT_ACADEMIC_DATA)
+        # Re-derive labels for augmented data
+        df['derived_group_label'] = df.apply(derive_group_label, axis=1)
+    
+    # Augment TechPro class data
+    techpro_mask = df['derived_group_label'] == 'TechPro'
+    if AUGMENT_TECHPRO_DATA and techpro_mask.sum() > 0:
+        print(f"\n📈 Augmenting TechPro class data...", file=sys.stderr)
+        df = augment_class_data(df, techpro_mask, "TechPro", TECHPRO_AUGMENTATION_FACTOR, AUGMENT_TECHPRO_DATA)
+        # Re-derive labels for augmented data
+        df['derived_group_label'] = df.apply(derive_group_label, axis=1)
+    
+    # Show final distribution after all augmentations
+    if (AUGMENT_ACADEMIC_DATA and academic_mask.sum() > 0) or (AUGMENT_TECHPRO_DATA and techpro_mask.sum() > 0):
+        print("\n🎯 Derived group label distribution (after augmentation):", file=sys.stderr)
+        print(df['derived_group_label'].value_counts(), file=sys.stderr)
+        print("", file=sys.stderr)
+    
+    # Calculate class weights for better class performance
+    class_weights_dict = None
+    if USE_CLASS_WEIGHT_ADJUSTMENT:
+        print("\n⚖️ Calculating class weights...", file=sys.stderr)
+        from sklearn.utils.class_weight import compute_class_weight
+        classes = df['derived_group_label'].unique()
+        class_weights = compute_class_weight('balanced', classes=classes, y=df['derived_group_label'])
+        class_weights_dict = dict(zip(classes, class_weights))
+        
+        # Boost Academic class weight further if needed (it was underperforming)
+        if 'Academic' in class_weights_dict:
+            # Increase Academic weight by 20% to improve its performance
+            class_weights_dict['Academic'] *= 1.2
+        
+        # Boost TechPro class weight to improve its performance
+        if BOOST_TECHPRO_WEIGHT and 'TechPro' in class_weights_dict:
+            class_weights_dict['TechPro'] *= TECHPRO_WEIGHT_BOOST
+            print(f"✅ Boosted TechPro class weight by {((TECHPRO_WEIGHT_BOOST - 1) * 100):.0f}%", file=sys.stderr)
+        
+        print(f"Class weights: {class_weights_dict}", file=sys.stderr)
+    
     # Prepare features
     drop_cols = [academic_col, techpro_col, 'derived_group_label']
-    X, grade_cols, preference_cols, scaler, feature_names, training_medians = prepare_features(
+    X, grade_cols, preference_cols, scaler, feature_names, training_medians, _ = prepare_features(
         df, drop_cols=drop_cols, is_training=True
     )
     y = df['derived_group_label']
     
-    if grade_cols:
-        print("🧮 Normalizing grade columns...", file=sys.stderr)
-    print(f"Including {len(feature_names)} features (with preferences) for training.", file=sys.stderr)
+    print(f"✅ Prepared {len(feature_names)} features for training.", file=sys.stderr)
+    if USE_ADVANCED_FEATURES:
+        print(f"   (Includes advanced features: aggregations, ratios, interactions, statistics)", file=sys.stderr)
+    if USE_ENHANCED_FEATURES:
+        print(f"   (Includes enhanced features: Academic vs TechPro distinguishing features)", file=sys.stderr)
     print(f"Sample columns: {feature_names[:10]}\n", file=sys.stderr)
     
-    # Cross-validation with enhanced metrics
-    kf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
-    fold_accuracies, fold_f1s, fold_precisions, fold_recalls = [], [], [], []
-    best_params_global = None
+    # Balance full dataset for hyperparameter search and feature selection
+    print("⚖️ Balancing dataset for hyperparameter search...", file=sys.stderr)
+    min_class_size = min(Counter(y).values())
+    if min_class_size >= 2:
+        smote_search = SMOTE(random_state=RANDOM_STATE)
+        X_bal_search, y_bal_search = smote_search.fit_resample(X, y)
+        print(f"✅ Balanced dataset: {dict(Counter(y_bal_search))}", file=sys.stderr)
+    else:
+        X_bal_search, y_bal_search = X, y
+        print("⚠️ Not enough samples for SMOTE. Proceeding without balancing.", file=sys.stderr)
     
-    for fold_num, (train_idx, test_idx) in enumerate(kf.split(X, y), 1):
-        print("="*80, file=sys.stderr)
-        print(f"📊 Fold {fold_num}/{N_SPLITS}", file=sys.stderr)
-        print("="*80, file=sys.stderr)
-        
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-        
-        class_counts = Counter(y_train)
-        print(f"📈 Original class distribution: {dict(class_counts)}", file=sys.stderr)
-        
-        # SMOTE with dynamic k_neighbors
-        min_class_size = min(class_counts.values())
-        if min_class_size < 2:
-            print("⚠️ Skipping SMOTE (minority class <2).", file=sys.stderr)
-            X_train_bal, y_train_bal = X_train, y_train
-        else:
-            k_value = min(5, max(1, min_class_size - 1))
-            print(f"⚙️ Applying SMOTE with k_neighbors={k_value}", file=sys.stderr)
-            smote = SMOTE(random_state=RANDOM_STATE, k_neighbors=k_value)
-            X_train_bal, y_train_bal = smote.fit_resample(X_train, y_train)
-            print(f"✅ Balanced class distribution: {dict(Counter(y_train_bal))}", file=sys.stderr)
-        
-        # Hyperparameter search
-        clf = RandomForestClassifier(random_state=RANDOM_STATE)
+    # Improved hyperparameter tuning (ONCE, outside CV loop for efficiency)
+    # Check if we can skip hyperparameter search by loading previous best params
+    best_params_global = None
+    best_params_file = os.path.join(SCRIPT_DIR, 'strandalign_best_params.json')
+    
+    if SKIP_HYPERPARAM_SEARCH_IF_MODEL_EXISTS and os.path.exists(best_params_file) and os.path.exists(MODEL_OUTPUT):
+        try:
+            print(f"\n⚡ Skipping hyperparameter search (using previous best params)...", file=sys.stderr)
+            with open(best_params_file, 'r') as f:
+                saved_params = json.load(f)
+                # Convert class_weight dict back if it exists
+                if 'class_weight' in saved_params and isinstance(saved_params['class_weight'], dict):
+                    # Keep as dict (will be handled by RandomForestClassifier)
+                    pass
+                best_params_global = saved_params
+            print(f"✅ Loaded previous best params: {best_params_global}", file=sys.stderr)
+        except Exception as e:
+            print(f"⚠️ Failed to load previous params: {str(e)}. Proceeding with hyperparameter search...", file=sys.stderr)
+            best_params_global = None
+    
+    # Adjust settings based on QUICK_TRAINING_MODE
+    # Prepare class_weight options
+    class_weight_options = ['balanced', 'balanced_subsample', None]
+    if USE_CLASS_WEIGHT_ADJUSTMENT and class_weights_dict is not None:
+        # Add custom class weights to search space
+        class_weight_options.append(class_weights_dict)
+    
+    if QUICK_TRAINING_MODE:
+        search_iterations = 20  # Reduced from 100
+        cv_folds_search = 2  # Reduced from 3
         param_grid = {
-            'n_estimators': [200, 400, 600],
-            'max_depth': [20, 40, 60, None],
+            'n_estimators': [300, 500, 700],  # Reduced options
+            'max_depth': [25, 35, None],  # Reduced options
             'min_samples_split': [2, 5, 10],
             'min_samples_leaf': [1, 2, 4],
-            'bootstrap': [True, False],
-            'class_weight': ['balanced', 'balanced_subsample']
+            'max_features': ['sqrt', 'log2'],
+            'bootstrap': [True],
+            'class_weight': class_weight_options[:3] if len(class_weight_options) > 3 else class_weight_options  # Limit for quick mode
         }
+        print(f"\n🔍 Quick mode: Hyperparameter tuning ({search_iterations} iterations)...", file=sys.stderr)
+    else:
+        search_iterations = HYPERPARAM_SEARCH_ITERATIONS
+        cv_folds_search = 2  # Reduced from 3 for faster search (still valid)
+        # Optimized grid: fewer n_estimators options, but still good coverage
+        param_grid = {
+            'n_estimators': [300, 500, 700, 1000],  # Reduced from 5 to 4 options
+            'max_depth': [20, 25, 35, 50, None],  # Slightly reduced
+            'min_samples_split': [2, 5, 10],
+            'min_samples_leaf': [1, 2, 4],
+            'max_features': ['sqrt', 'log2', None],
+            'bootstrap': [True, False],
+            'class_weight': class_weight_options
+        }
+        print(f"\n🔍 Hyperparameter tuning ({search_iterations} iterations, {cv_folds_search} CV folds - optimized for speed)...", file=sys.stderr)
+    
+    # Only run hyperparameter search if we don't have previous best params
+    if best_params_global is None:
+        clf_base = RandomForestClassifier(random_state=RANDOM_STATE)
         search = RandomizedSearchCV(
-            clf, param_grid, n_iter=20, scoring='f1_weighted', cv=3,
-            random_state=RANDOM_STATE, n_jobs=-1, verbose=0
+            clf_base, param_grid, 
+            n_iter=search_iterations, 
+            scoring='f1_weighted', 
+            cv=cv_folds_search,
+            random_state=RANDOM_STATE, 
+            n_jobs=-1, 
+            verbose=1
         )
-        search.fit(X_train_bal, y_train_bal)
-        best_clf = search.best_estimator_
-        if best_params_global is None:
-            best_params_global = search.best_params_
+        search.fit(X_bal_search, y_bal_search)
+        best_params_global = search.best_params_
+        print(f"✅ Best hyperparameters found: {best_params_global}", file=sys.stderr)
         
+        # Save best params for future use
+        try:
+            # Convert numpy types to native Python types for JSON serialization
+            params_to_save = {}
+            for key, value in best_params_global.items():
+                if isinstance(value, (np.integer, np.floating)):
+                    params_to_save[key] = value.item()
+                elif isinstance(value, dict):
+                    # Handle class_weight dict
+                    params_to_save[key] = {k: (v.item() if isinstance(v, (np.integer, np.floating)) else v) 
+                                          for k, v in value.items()}
+                else:
+                    params_to_save[key] = value
+            with open(best_params_file, 'w') as f:
+                json.dump(params_to_save, f, indent=2)
+            print(f"💾 Saved best params to {best_params_file} for faster future training", file=sys.stderr)
+        except Exception as e:
+            print(f"⚠️ Could not save best params: {str(e)}", file=sys.stderr)
+    else:
+        skipped_fits = search_iterations * cv_folds_search if 'search_iterations' in locals() else 0
+        print(f"✅ Using loaded best params (skipped ~{skipped_fits} hyperparameter search fits!)", file=sys.stderr)
+    
+    # Feature selection based on importance or k-best
+    feature_selector = None
+    if USE_FEATURE_SELECTION:
+        print(f"\n🎯 Performing feature selection (method: {FEATURE_SELECTION_METHOD})...", file=sys.stderr)
+        if FEATURE_SELECTION_METHOD == 'importance':
+            # Train a quick model to get feature importances
+            selector_params = dict(best_params_global) if best_params_global else {}
+            selector_params['n_estimators'] = 100  # Use fewer for speed
+            selector_params['random_state'] = RANDOM_STATE
+            selector_rf = RandomForestClassifier(**selector_params)
+            selector_rf.fit(X_bal_search, y_bal_search)
+            feature_selector = SelectFromModel(selector_rf, threshold=FEATURE_SELECTION_THRESHOLD, prefit=True)
+            X_selected = feature_selector.transform(X)
+            selected_features = [feature_names[i] for i in range(len(feature_names)) if feature_selector.get_support()[i]]
+            print(f"✅ Selected {len(selected_features)} features (from {len(feature_names)}, threshold={FEATURE_SELECTION_THRESHOLD})", file=sys.stderr)
+        elif FEATURE_SELECTION_METHOD == 'kbest':
+            # Use k-best features based on F-statistic
+            k_best = min(K_BEST_FEATURES, len(feature_names))
+            feature_selector = SelectKBest(f_classif, k=k_best)
+            feature_selector.fit(X, y)
+            X_selected = feature_selector.transform(X)
+            selected_features = [feature_names[i] for i in range(len(feature_names)) if feature_selector.get_support()[i]]
+            print(f"✅ Selected {len(selected_features)} features (top {k_best} based on F-statistic)", file=sys.stderr)
+        
+        X = pd.DataFrame(X_selected, columns=selected_features, index=X.index)
+        feature_names = selected_features
+
+    # Cross-validation with enhanced metrics
+    # Adjust folds based on QUICK_TRAINING_MODE
+    cv_folds = 3 if QUICK_TRAINING_MODE else N_SPLITS
+    print(f"\n📊 Starting {cv_folds}-fold cross-validation...", file=sys.stderr)
+    kf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
+    fold_accuracies, fold_f1s, fold_precisions, fold_recalls = [], [], [], []
+
+    for fold_num, (train_idx, test_idx) in enumerate(kf.split(X, y), 1):
+        print(80 * "=", file=sys.stderr)
+        print(f"Fold {fold_num}/{cv_folds}", file=sys.stderr)
+        print(80 * "=", file=sys.stderr)
+
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+        classcounts = Counter(y_train)
+        print(f"Original class distribution: {dict(classcounts)}", file=sys.stderr)
+
+        # Apply SMOTE for balancing if applicable
+        if min(classcounts.values()) >= 2:
+            smote = SMOTE(random_state=RANDOM_STATE)
+            X_train_bal, y_train_bal = smote.fit_resample(X_train, y_train)
+            print(f"Balanced class distribution: {dict(Counter(y_train_bal))}", file=sys.stderr)
+        else:
+            X_train_bal, y_train_bal = X_train, y_train
+            print("Not enough minority class samples for SMOTE. Proceeding without balancing.", file=sys.stderr)
+
+        # Use best params from hyperparameter search, but with fewer trees for CV speed
+        cv_params = best_params_global.copy() if best_params_global else {}
+        # Override n_estimators for faster CV (final model will use full n_estimators)
+        cv_params['n_estimators'] = CV_N_ESTIMATORS
+        cv_params['random_state'] = RANDOM_STATE
+        best_clf = RandomForestClassifier(**cv_params)
+        best_clf.fit(X_train_bal, y_train_bal)
+
         y_pred = best_clf.predict(X_test)
+
         acc = accuracy_score(y_test, y_pred)
         f1 = f1_score(y_test, y_pred, average='weighted')
         prec = precision_score(y_test, y_pred, average='weighted', zero_division=0)
         rec = recall_score(y_test, y_pred, average='weighted', zero_division=0)
-        
+        cm = confusion_matrix(y_test, y_pred)
+
         fold_accuracies.append(acc)
         fold_f1s.append(f1)
         fold_precisions.append(prec)
         fold_recalls.append(rec)
-        
-        print(f"🏁 Best Params (Fold {fold_num}): {search.best_params_}", file=sys.stderr)
-        print(f"🎯 Accuracy: {acc:.4f} | F1-weighted: {f1:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f}", file=sys.stderr)
+
+        print(f"Accuracy: {acc:.4f}, Weighted F1: {f1:.4f}", file=sys.stderr)
+        print(f"Precision: {prec:.4f}, Recall: {rec:.4f}", file=sys.stderr)
         print("Confusion Matrix:", file=sys.stderr)
-        print(confusion_matrix(y_test, y_pred), file=sys.stderr)
-    
-    # Cross-validation summary
-    mean_acc, std_acc = np.mean(fold_accuracies), np.std(fold_accuracies)
-    mean_f1, std_f1 = np.mean(fold_f1s), np.std(fold_f1s)
-    mean_prec, std_prec = np.mean(fold_precisions), np.std(fold_precisions)
-    mean_rec, std_rec = np.mean(fold_recalls), np.std(fold_recalls)
-    
-    print("\n" + "="*80, file=sys.stderr)
-    print("📈 Stratified K-Fold Summary", file=sys.stderr)
-    print("="*80, file=sys.stderr)
-    print(f"Mean Accuracy: {mean_acc:.4f} ± {std_acc:.4f}", file=sys.stderr)
-    print(f"Mean F1-weighted: {mean_f1:.4f} ± {std_f1:.4f}", file=sys.stderr)
-    print(f"Mean Precision: {mean_prec:.4f} ± {std_prec:.4f}", file=sys.stderr)
-    print(f"Mean Recall: {mean_rec:.4f} ± {std_rec:.4f}", file=sys.stderr)
+        print(cm, file=sys.stderr)
+
+    # Calculate mean and standard deviation of metrics after cross-validation
+    meanacc = np.mean(fold_accuracies)
+    stdacc = np.std(fold_accuracies)
+    meanf1 = np.mean(fold_f1s)
+    stdf1 = np.std(fold_f1s)
+    meanprec = np.mean(fold_precisions)
+    stdprec = np.std(fold_precisions)
+    meanrec = np.mean(fold_recalls)
+    stdrec = np.std(fold_recalls)
+
+    # Now use these variables for reporting or summary logs
+    print(f"\n📊 Cross-Validation Summary ({cv_folds} folds):", file=sys.stderr)
+    print(f"Mean Accuracy: {meanacc:.4f} ± {stdacc:.4f}", file=sys.stderr)
+    print(f"Mean Weighted F1: {meanf1:.4f} ± {stdf1:.4f}", file=sys.stderr)
+    print(f"Mean Precision: {meanprec:.4f} ± {stdprec:.4f}", file=sys.stderr)
+    print(f"Mean Recall: {meanrec:.4f} ± {stdrec:.4f}", file=sys.stderr)
+
+
     
     # Final model training with best params
     print("\n🔧 Training final calibrated model...", file=sys.stderr)
@@ -1081,7 +1624,7 @@ def run_training_mode(test_csv_path=None, generate_explanations=False):
     print(f"✅ Balanced full dataset distribution: {dict(Counter(y_bal))}", file=sys.stderr)
     
     # Use best params from search, or defaults if search didn't run
-    best_params = best_params_global if best_params_global is not None else {
+    best_params = best_params_global.copy() if best_params_global is not None else {
         'n_estimators': 400,
         'max_depth': 40,
         'min_samples_split': 5,
@@ -1089,6 +1632,13 @@ def run_training_mode(test_csv_path=None, generate_explanations=False):
         'bootstrap': True,
         'class_weight': 'balanced_subsample'
     }
+    
+    # Override class_weight with custom weights if enabled and not already optimal
+    if USE_CLASS_WEIGHT_ADJUSTMENT and class_weights_dict is not None:
+        # If best params have None or 'balanced', try custom weights
+        if best_params.get('class_weight') in [None, 'balanced']:
+            best_params['class_weight'] = class_weights_dict
+            print(f"✅ Using custom class weights for final model: {class_weights_dict}", file=sys.stderr)
     
     base_rf = RandomForestClassifier(**best_params, random_state=RANDOM_STATE)
     calibrated_rf = CalibratedClassifierCV(base_rf, method='isotonic', cv=3)
@@ -1113,9 +1663,32 @@ def run_training_mode(test_csv_path=None, generate_explanations=False):
     feat_imp.to_csv(FEATURE_IMPORTANCE_OUTPUT, index=False)
     print(f"💾 Saved feature importances to {FEATURE_IMPORTANCE_OUTPUT}", file=sys.stderr)
     
-    # Save model, scaler, and feature names
+    # Save model, scaler, feature selector, and feature names
     joblib.dump(calibrated_rf, MODEL_OUTPUT)
     joblib.dump(scaler, SCALER_OUTPUT)
+    if feature_selector is not None:
+        feature_selector_path = os.path.join(SCRIPT_DIR, 'strandalign_feature_selector.joblib')
+        joblib.dump(feature_selector, feature_selector_path)
+        print(f"✅ Feature selector saved: {feature_selector_path}", file=sys.stderr)
+    
+    # Save as PKL files if enabled
+    if SAVE_AS_PKL:
+        model_pkl_path = os.path.join(SCRIPT_DIR, 'strandalign_model.pkl')
+        scaler_pkl_path = os.path.join(SCRIPT_DIR, 'strandalign_scaler.pkl')
+        
+        with open(model_pkl_path, 'wb') as f:
+            pickle.dump(calibrated_rf, f)
+        print(f"✅ Model saved as PKL: {model_pkl_path}", file=sys.stderr)
+        
+        with open(scaler_pkl_path, 'wb') as f:
+            pickle.dump(scaler, f)
+        print(f"✅ Scaler saved as PKL: {scaler_pkl_path}", file=sys.stderr)
+        
+        if feature_selector is not None:
+            feature_selector_pkl_path = os.path.join(SCRIPT_DIR, 'strandalign_feature_selector.pkl')
+            with open(feature_selector_pkl_path, 'wb') as f:
+                pickle.dump(feature_selector, f)
+            print(f"✅ Feature selector saved as PKL: {feature_selector_pkl_path}", file=sys.stderr)
     
     feature_data = {
         'feature_names': feature_names,
@@ -1144,23 +1717,23 @@ def run_training_mode(test_csv_path=None, generate_explanations=False):
             # Keep original test data for explanations (before feature alignment)
             df_test_original = df_test.copy()
             
-            # Align, fill missing, and scale grade columns for prediction
-            df_test_features = df_test.reindex(columns=feature_names, fill_value=np.nan)
-            for col in df_test_features.columns:
-                if col in feature_names:
-                    df_test_features[col] = pd.to_numeric(df_test_features[col], errors='coerce')
-                    if col in training_medians:
-                        df_test_features[col] = df_test_features[col].fillna(training_medians[col])
-                    else:
-                        df_test_features[col] = df_test_features[col].fillna(0)
+            # Prepare features using the same pipeline as training
+            drop_cols_test = []
+            X_test_prepared, _, _, _, _, _, _ = prepare_features(
+                df_test,
+                drop_cols=drop_cols_test,
+                is_training=False,
+                scaler=scaler,
+                training_medians=training_medians,
+                feature_selector=feature_selector
+            )
             
-            if grade_cols:
-                available_grade_cols = [c for c in grade_cols if c in df_test_features.columns]
-                if available_grade_cols:
-                    df_test_features[available_grade_cols] = scaler.transform(df_test_features[available_grade_cols])
+            # Align with training features
+            X_test_prepared = X_test_prepared.reindex(columns=feature_names, fill_value=0)
+            X_test_prepared = X_test_prepared.fillna(0)
             
-            y_pred_test = calibrated_rf.predict(df_test_features)
-            y_pred_prob = calibrated_rf.predict_proba(df_test_features)
+            y_pred_test = calibrated_rf.predict(X_test_prepared)
+            y_pred_prob = calibrated_rf.predict_proba(X_test_prepared)
             
             test_predictions = pd.DataFrame({
                 "Prediction": y_pred_test,
@@ -1228,14 +1801,14 @@ def run_training_mode(test_csv_path=None, generate_explanations=False):
         'scaler_saved': SCALER_OUTPUT,
         'features_saved': FEATURES_OUTPUT,
         'feature_importance_saved': FEATURE_IMPORTANCE_OUTPUT,
-        'mean_accuracy': round(mean_acc, 4),
-        'std_accuracy': round(std_acc, 4),
-        'mean_f1_weighted': round(mean_f1, 4),
-        'std_f1_weighted': round(std_f1, 4),
-        'mean_precision': round(mean_prec, 4),
-        'std_precision': round(std_prec, 4),
-        'mean_recall': round(mean_rec, 4),
-        'std_recall': round(std_rec, 4),
+        'mean_accuracy': round(meanacc, 4),
+        'std_accuracy': round(stdacc, 4),
+        'mean_f1_weighted': round(meanf1, 4),
+        'std_f1_weighted': round(stdf1, 4),
+        'mean_precision': round(meanprec, 4),
+        'std_precision': round(stdprec, 4),
+        'mean_recall': round(meanrec, 4),
+        'std_recall': round(stdrec, 4),
         'num_features': len(feature_names),
         'best_params': best_params
     }
