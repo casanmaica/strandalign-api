@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import json
-import sys
+import sys  
 import os
 import pickle
 
@@ -66,6 +66,7 @@ MODEL_OUTPUT = os.path.join(SCRIPT_DIR, 'strandalign_model.joblib')
 SCALER_OUTPUT = os.path.join(SCRIPT_DIR, 'strandalign_scaler.joblib')
 FEATURES_OUTPUT = os.path.join(SCRIPT_DIR, 'strandalign_features.json')
 FEATURE_IMPORTANCE_OUTPUT = os.path.join(SCRIPT_DIR, 'feature_importances.csv')
+FEATURE_IMPORTANCE_JSON = os.path.join(SCRIPT_DIR, 'ml', 'feature_importances.json')
 RANDOM_STATE = 42
 N_SPLITS = 3  # Reduced from 5 to 3 for faster training (still statistically valid)
 # Performance improvement settings
@@ -2155,6 +2156,21 @@ def run_training_mode(test_csv_path=None, generate_explanations=False):
     
     feat_imp.to_csv(FEATURE_IMPORTANCE_OUTPUT, index=False)
     print(f"💾 Saved feature importances to {FEATURE_IMPORTANCE_OUTPUT}", file=sys.stderr)
+    
+    # Also save as JSON for easy PHP access (top 15 features)
+    os.makedirs(os.path.dirname(FEATURE_IMPORTANCE_JSON), exist_ok=True)
+    top_features_json = feat_imp.head(15).to_dict('records')
+    # Convert to simple format: [{"name": "...", "importance": ...}, ...]
+    features_json = [
+        {
+            "name": row["Feature"],
+            "importance": round(float(row["Importance (%)"]), 2)
+        }
+        for row in top_features_json
+    ]
+    with open(FEATURE_IMPORTANCE_JSON, 'w', encoding='utf-8') as f:
+        json.dump(features_json, f, indent=2, ensure_ascii=False)
+    print(f"💾 Saved feature importances JSON to {FEATURE_IMPORTANCE_JSON}", file=sys.stderr)
     
     # Generate visualizations for thesis paper
     print("\n📊 Generating visualizations for thesis paper...", file=sys.stderr)
