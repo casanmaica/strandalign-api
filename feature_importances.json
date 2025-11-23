@@ -1,0 +1,62 @@
+[
+  {
+    "name": "I prefer to take an Academic Track (STEM, ABM, HUMSS, GAS, SPORTS, AND ARTS AND DESIGN).\nMas gusto kong kumuha ng Academic Track  (STEM, ABM, HUMSS, GAS, SPORTS, AND ARTS AND DESIGN).",
+    "importance": 13.33
+  },
+  {
+    "name": "I prefer to take a  Technical-Professional Track  (ICT, HE, Industrial Arts, Caregiving, etc.). \nMas gusto kong kumuha ng  Technical-Professional Track  (ICT, HE, Industrial Arts, Caregiving, etc.). ",
+    "importance": 12.96
+  },
+  {
+    "name": "grade_std",
+    "importance": 8.56
+  },
+  {
+    "name": "academic_consistency",
+    "importance": 3.53
+  },
+  {
+    "name": "best_vs_worst_ratio",
+    "importance": 2.09
+  },
+  {
+    "name": "grade_mean",
+    "importance": 1.83
+  },
+  {
+    "name": "theoretical_avg",
+    "importance": 1.61
+  },
+  {
+    "name": "Grade 8 TLE",
+    "importance": 1.56
+  },
+  {
+    "name": "tle_vs_math_ratio",
+    "importance": 1.52
+  },
+  {
+    "name": "Grade 7 MAPEH",
+    "importance": 1.5
+  },
+  {
+    "name": "tle_avg",
+    "importance": 1.45
+  },
+  {
+    "name": "Grade 7 English",
+    "importance": 1.42
+  },
+  {
+    "name": "techpro_strength_score",
+    "importance": 1.42
+  },
+  {
+    "name": "english_avg",
+    "importance": 1.39
+  },
+  {
+    "name": "Grade 7 Science",
+    "importance": 1.38
+  }
+]
